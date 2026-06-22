@@ -51,4 +51,14 @@ public class Stops {
                 ", platform_code='" + platform_code + '\'' +
                 '}';
     }
+    public String getStop_id() {
+        return stop_id;
+    }
+    public String getStop_lat() {
+        return stop_lat;
+    }
+    public String getStop_lon() {
+        return stop_lon;
+    }
+   
 }
