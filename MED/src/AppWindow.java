@@ -2,22 +2,34 @@ import javax.swing.*;
 import javax.swing.border.*;
 import java.awt.*;
 import java.awt.event.*;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.List;
 
+/**
+ * Interface Java construite à partir du code de l'équipe.
+ * Les fonctionnalités algorithmiques (Dijkstra, Kruskal, BFS)
+ * sont marquées "En attente" — elles seront branchées
+ * quand l'équipe aura terminé leur implémentation.
+ */
 public class AppWindow extends JFrame {
 
+    // ── Composants ────────────────────────────────────────────────
     private final MapPanel mapPanel;
-    private final JLabel badgeLabel;
+    private final JLabel   badgeLabel;
+
     private final JComboBox<String> departBox  = new JComboBox<>();
     private final JComboBox<String> arriveeBox = new JComboBox<>();
-    private final JLabel resultLabel           = new JLabel(" ");
+    private final JLabel            resultLabel = new JLabel(" ");
 
-    // Colors
+    // ── Couleurs (identiques à l'original) ────────────────────────
     private static final Color BG_DARK    = new Color(22, 33, 62);
     private static final Color ACCENT     = new Color(227, 5, 28);
     private static final Color BG_SIDEBAR = new Color(247, 248, 250);
     private static final Color LABEL_GREY = new Color(130, 130, 130);
+
+    // ── Constructeur ─────────────────────────────────────────────
 
     public AppWindow() {
         setTitle("Métro, Efrei, Dodo");
@@ -26,7 +38,7 @@ public class AppWindow extends JFrame {
         setMinimumSize(new Dimension(900, 600));
         setLocationRelativeTo(null);
 
-        mapPanel  = new MapPanel(Collections.emptyList());
+        mapPanel   = new MapPanel(Collections.emptyList());
         badgeLabel = new JLabel("Chargement…");
 
         setLayout(new BorderLayout());
@@ -34,7 +46,6 @@ public class AppWindow extends JFrame {
         add(mapPanel,       BorderLayout.CENTER);
         add(buildSidebar(), BorderLayout.EAST);
 
-        // Click on a marker → select station in the departure box
         mapPanel.setOnStationClick(s -> departBox.setSelectedItem(s.name));
 
         addWindowListener(new WindowAdapter() {
@@ -42,16 +53,15 @@ public class AppWindow extends JFrame {
         });
     }
 
-    // ── Loading (runs in background, called right after setVisible) ──
+    // ── Chargement automatique au démarrage (depuis MetroLoader) ──
 
     public void startLoading() {
-        SwingWorker<List<MetroLoader.StationInfo>, String> worker =
-                new SwingWorker<>() {
+        badgeLabel.setText("Chargement…");
+        SwingWorker<List<MetroLoader.StationInfo>, String> worker = new SwingWorker<>() {
             @Override
             protected List<MetroLoader.StationInfo> doInBackground() throws Exception {
                 return new MetroLoader().loadMetroStations();
             }
-
             @Override
             protected void done() {
                 try {
@@ -60,14 +70,146 @@ public class AppWindow extends JFrame {
                     mapPanel.setStations(stations);
                     populateCombos(stations);
                 } catch (Exception e) {
-                    badgeLabel.setText("Erreur");
-                    JOptionPane.showMessageDialog(AppWindow.this,
-                            "Impossible de charger les données GTFS :\n" + e.getMessage(),
-                            "Erreur", JOptionPane.ERROR_MESSAGE);
+                    badgeLabel.setText("— fichier GTFS introuvable —");
                 }
             }
         };
         worker.execute();
+    }
+
+    // ── Chargement depuis un dossier sélectionné par l'utilisateur ─
+
+    private void chargerDepuisDossier() {
+        JFileChooser fc = new JFileChooser();
+        fc.setDialogTitle("Sélectionner le dossier GTFS");
+        fc.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+        if (fc.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+
+        File dossier = fc.getSelectedFile();
+        badgeLabel.setText("Chargement…");
+
+        SwingWorker<List<MetroLoader.StationInfo>, Void> worker = new SwingWorker<>() {
+            @Override
+            protected List<MetroLoader.StationInfo> doInBackground() throws Exception {
+                return chargerStations(dossier);
+            }
+            @Override
+            protected void done() {
+                try {
+                    List<MetroLoader.StationInfo> stations = get();
+                    badgeLabel.setText(stations.size() + " stations");
+                    mapPanel.setStations(stations);
+                    populateCombos(stations);
+                    resultLabel.setText("<html><b>" + stations.size() + " stations chargées</b>"
+                        + " depuis " + dossier.getName() + "</html>");
+                } catch (Exception ex) {
+                    badgeLabel.setText("Erreur");
+                    JOptionPane.showMessageDialog(AppWindow.this,
+                        "Impossible de lire le dossier GTFS :\n" + ex.getMessage(),
+                        "Erreur", JOptionPane.ERROR_MESSAGE);
+                }
+            }
+        };
+        worker.execute();
+    }
+
+    /**
+     * Charge la liste des stations métro depuis un dossier GTFS.
+     * Reprend la logique de MetroLoader en acceptant un chemin absolu.
+     */
+    private List<MetroLoader.StationInfo> chargerStations(File dossier) throws IOException {
+        // Étape 1 : routes métro (type 1)
+        Set<String> metroRouteIds = new HashSet<>();
+        try (BufferedReader br = reader(dossier, "routes.txt")) {
+            br.readLine(); // header
+            String line;
+            while ((line = br.readLine()) != null) {
+                String[] f = line.split(",", -1);
+                if (f.length > 5 && "1".equals(f[5].trim()))
+                    metroRouteIds.add(f[0].trim());
+            }
+        }
+
+        // Étape 2 : trips correspondants
+        Set<String> metroTripIds = new HashSet<>();
+        try (BufferedReader br = reader(dossier, "trips.txt")) {
+            br.readLine();
+            String line;
+            while ((line = br.readLine()) != null) {
+                String[] f = line.split(",", -1);
+                if (f.length > 2 && metroRouteIds.contains(f[0].trim()))
+                    metroTripIds.add(f[2].trim());
+            }
+        }
+
+        // Étape 3 : tous les arrêts
+        Map<String, String[]> allStops = new HashMap<>(); // id → [name, lat, lon, parent]
+        try (BufferedReader br = reader(dossier, "stops.txt")) {
+            String header = br.readLine();
+            String[] h = header.split(",", -1);
+            int iId=-1, iName=-1, iLat=-1, iLon=-1, iParent=-1;
+            for (int i=0;i<h.length;i++) {
+                switch (h[i].trim().toLowerCase()) {
+                    case "stop_id"        -> iId     = i;
+                    case "stop_name"      -> iName   = i;
+                    case "stop_lat"       -> iLat    = i;
+                    case "stop_lon"       -> iLon    = i;
+                    case "parent_station" -> iParent = i;
+                }
+            }
+            String line;
+            while ((line = br.readLine()) != null) {
+                String[] f = line.split(",", -1);
+                if (f.length <= Math.max(iId, Math.max(iLat, iLon))) continue;
+                String latS = iLat>=0 ? f[iLat].trim() : "";
+                String lonS = iLon>=0 ? f[iLon].trim() : "";
+                if (latS.isEmpty() || lonS.isEmpty()) continue;
+                String id     = iId>=0     ? f[iId].trim()     : "";
+                String name   = iName>=0   ? f[iName].trim()   : "";
+                String parent = iParent>=0 ? f[iParent].trim() : "";
+                allStops.put(id, new String[]{name, latS, lonS, parent});
+            }
+        }
+
+        // Étape 4 : stop_times en streaming → trouver les stations parentes
+        Set<String> stationIds = new HashSet<>();
+        try (BufferedReader br = new BufferedReader(
+                new InputStreamReader(new FileInputStream(new File(dossier,"stop_times.txt")),
+                        StandardCharsets.UTF_8), 1<<16)) {
+            br.readLine();
+            String line;
+            while ((line = br.readLine()) != null) {
+                int c0 = line.indexOf(',');
+                if (c0 < 0) continue;
+                if (!metroTripIds.contains(line.substring(0, c0))) continue;
+                int c1=line.indexOf(',',c0+1), c2=line.indexOf(',',c1+1), c3=line.indexOf(',',c2+1);
+                if (c1<0||c2<0) continue;
+                String stopId = c3<0 ? line.substring(c2+1) : line.substring(c2+1, c3);
+                String[] s = allStops.get(stopId.trim());
+                if (s==null) continue;
+                stationIds.add(s[3].isEmpty() ? stopId.trim() : s[3]);
+            }
+        }
+
+        // Étape 5 : construction liste finale, dédupliquée par nom (comme MetroLoader)
+        Map<String, MetroLoader.StationInfo> byName = new LinkedHashMap<>();
+        for (String id : stationIds) {
+            String[] d = allStops.get(id);
+            if (d==null || d[0].isEmpty()) continue;
+            try {
+                double lat = Double.parseDouble(d[1]);
+                double lon = Double.parseDouble(d[2]);
+                byName.putIfAbsent(d[0], new MetroLoader.StationInfo(d[0], lat, lon));
+            } catch (NumberFormatException ignored) {}
+        }
+        List<MetroLoader.StationInfo> list = new ArrayList<>(byName.values());
+        list.sort(Comparator.comparing(s -> s.name));
+        return list;
+    }
+
+    private BufferedReader reader(File dossier, String file) throws IOException {
+        return new BufferedReader(new InputStreamReader(
+                new FileInputStream(new File(dossier, file)), StandardCharsets.UTF_8));
     }
 
     private void populateCombos(List<MetroLoader.StationInfo> stations) {
@@ -81,14 +223,13 @@ public class AppWindow extends JFrame {
         }
     }
 
-    // ── Header ───────────────────────────────────────────────────
+    // ── Header (identique à l'original) ─────────────────────────
 
     private JPanel buildHeader() {
         JPanel header = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 8));
         header.setBackground(BG_DARK);
         header.setPreferredSize(new Dimension(0, 52));
 
-        // "M" logo
         JPanel logo = new JPanel() {
             @Override protected void paintComponent(Graphics g) {
                 Graphics2D g2 = (Graphics2D) g;
@@ -98,9 +239,8 @@ public class AppWindow extends JFrame {
                 g2.setColor(Color.WHITE);
                 g2.setFont(new Font("Segoe UI", Font.BOLD, 17));
                 FontMetrics fm = g2.getFontMetrics();
-                g2.drawString("M",
-                        (getWidth()  - fm.stringWidth("M")) / 2,
-                        (getHeight() + fm.getAscent() - fm.getDescent()) / 2);
+                g2.drawString("M", (getWidth()-fm.stringWidth("M"))/2,
+                        (getHeight()+fm.getAscent()-fm.getDescent())/2);
             }
         };
         logo.setPreferredSize(new Dimension(34, 34));
@@ -127,7 +267,6 @@ public class AppWindow extends JFrame {
         sidebar.setPreferredSize(new Dimension(295, 0));
         sidebar.setBackground(BG_SIDEBAR);
 
-        // Red title bar
         JPanel sideTitle = new JPanel(new FlowLayout(FlowLayout.LEFT, 14, 11));
         sideTitle.setBackground(ACCENT);
         sideTitle.setPreferredSize(new Dimension(0, 44));
@@ -137,19 +276,39 @@ public class AppWindow extends JFrame {
         sideTitle.add(t);
         sidebar.add(sideTitle, BorderLayout.NORTH);
 
-        // Body
         JPanel body = new JPanel();
         body.setBackground(BG_SIDEBAR);
         body.setLayout(new BoxLayout(body, BoxLayout.Y_AXIS));
-        body.setBorder(new EmptyBorder(18, 16, 18, 16));
+        body.setBorder(new EmptyBorder(14, 16, 14, 16));
 
+        // ── Données GTFS ──────────────────────────────────────────
+        body.add(sectionLabel("DONNÉES"));
+        body.add(vgap(6));
+
+        JButton loadBtn = new JButton("Charger les stations…");
+        loadBtn.setBackground(BG_DARK);
+        loadBtn.setForeground(Color.WHITE);
+        loadBtn.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        loadBtn.setFocusPainted(false);
+        loadBtn.setBorderPainted(false);
+        loadBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        loadBtn.setMaximumSize(new Dimension(Integer.MAX_VALUE, 36));
+        loadBtn.setAlignmentX(LEFT_ALIGNMENT);
+        loadBtn.setToolTipText("Sélectionner le dossier GTFS (routes.txt, stops.txt…)");
+        loadBtn.addActionListener(e -> chargerDepuisDossier());
+        body.add(loadBtn);
+
+        body.add(vgap(16));
+        body.add(separateur());
+        body.add(vgap(16));
+
+        // ── Itinéraire ─────────────────────────────────────────────
         body.add(sectionLabel("DÉPART"));
         body.add(vgap(5));
         styleCombo(departBox);
         body.add(departBox);
         body.add(vgap(5));
 
-        // Swap button row
         JPanel swapRow = new JPanel(new FlowLayout(FlowLayout.CENTER, 0, 0));
         swapRow.setBackground(BG_SIDEBAR);
         swapRow.setMaximumSize(new Dimension(Integer.MAX_VALUE, 32));
@@ -178,13 +337,13 @@ public class AppWindow extends JFrame {
         body.add(arriveeBox);
         body.add(vgap(16));
 
-        JSeparator sep = new JSeparator();
-        sep.setMaximumSize(new Dimension(Integer.MAX_VALUE, 1));
-        sep.setForeground(new Color(218, 218, 218));
-        body.add(sep);
+        JSeparator sep1 = new JSeparator();
+        sep1.setMaximumSize(new Dimension(Integer.MAX_VALUE, 1));
+        sep1.setForeground(new Color(218, 218, 218));
+        body.add(sep1);
         body.add(vgap(16));
 
-        // Search button
+        // Bouton "Rechercher" (Dijkstra — en attente)
         JButton searchBtn = new JButton("Rechercher un itinéraire");
         searchBtn.setBackground(ACCENT);
         searchBtn.setForeground(Color.WHITE);
@@ -202,7 +361,7 @@ public class AppWindow extends JFrame {
         body.add(searchBtn);
         body.add(vgap(14));
 
-        // Result card
+        // Carte résultat
         JPanel card = new JPanel(new BorderLayout());
         card.setBackground(Color.WHITE);
         card.setMaximumSize(new Dimension(Integer.MAX_VALUE, 110));
@@ -216,7 +375,6 @@ public class AppWindow extends JFrame {
         card.add(resultLabel, BorderLayout.CENTER);
         body.add(card);
 
-        // Focus button — center map on selected departure
         body.add(vgap(10));
         JButton focusBtn = new JButton("Centrer la carte sur le départ");
         focusBtn.setBackground(BG_DARK);
@@ -233,6 +391,25 @@ public class AppWindow extends JFrame {
         });
         body.add(focusBtn);
 
+        body.add(vgap(16));
+        body.add(separateur());
+        body.add(vgap(16));
+
+        // ── Outils (en attente) ────────────────────────────────────
+        body.add(sectionLabel("OUTILS"));
+        body.add(vgap(8));
+
+        body.add(boutonEnAttente("Arbre Couvrant Minimal (Kruskal)",
+                "Kruskal : arbre couvrant de poids minimal"));
+        body.add(vgap(8));
+
+        body.add(boutonEnAttente("Vérifier la connexité (BFS)",
+                "BFS : vérification de la connexité du réseau"));
+        body.add(vgap(8));
+
+        body.add(boutonEnAttente("Stations PMR accessibles",
+                "Filtre PMR : parcours limité aux stations accessibles"));
+
         sidebar.add(body, BorderLayout.CENTER);
         return sidebar;
     }
@@ -244,16 +421,36 @@ public class AppWindow extends JFrame {
         String a = (String) arriveeBox.getSelectedItem();
         if (d == null || d.startsWith("—") || a == null || a.startsWith("—")) {
             resultLabel.setText("<html>⚠ Sélectionnez un départ et une arrivée.</html>");
-        } else if (d.equals(a)) {
-            resultLabel.setText("<html>⚠ Le départ et l'arrivée sont identiques.</html>");
-        } else {
-            resultLabel.setText("<html><b>" + esc(d) + "</b>"
-                    + " &rarr; <b>" + esc(a) + "</b><br><br>"
-                    + "<i>🚧 Fonctionnalité à venir —<br>Dijkstra branché à l'étape suivante.</i></html>");
+            return;
         }
+        if (d.equals(a)) {
+            resultLabel.setText("<html>⚠ Le départ et l'arrivée sont identiques.</html>");
+            return;
+        }
+        // Algorithme Dijkstra — en attente d'implémentation par l'équipe
+        resultLabel.setText("<html><b>" + esc(d) + "</b> → <b>" + esc(a) + "</b>"
+                + "<br><br><i>🚧 En attente — Dijkstra en cours d'implémentation.</i></html>");
     }
 
     // ── Helpers ───────────────────────────────────────────────────
+
+    private JButton boutonEnAttente(String label, String tooltipAlgo) {
+        JButton b = new JButton(label);
+        b.setBackground(new Color(240, 240, 242));
+        b.setForeground(new Color(80, 80, 80));
+        b.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        b.setFocusPainted(false);
+        b.setBorderPainted(true);
+        b.setBorder(BorderFactory.createLineBorder(new Color(210, 210, 215)));
+        b.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        b.setMaximumSize(new Dimension(Integer.MAX_VALUE, 36));
+        b.setAlignmentX(LEFT_ALIGNMENT);
+        b.setToolTipText(tooltipAlgo);
+        b.addActionListener(e ->
+            resultLabel.setText("<html><i>🚧 En attente —<br>"
+                + esc(tooltipAlgo) + ".</i></html>"));
+        return b;
+    }
 
     private JLabel sectionLabel(String text) {
         JLabel l = new JLabel(text);
@@ -265,6 +462,13 @@ public class AppWindow extends JFrame {
 
     private Component vgap(int h) {
         return Box.createRigidArea(new Dimension(0, h));
+    }
+
+    private Component separateur() {
+        JSeparator s = new JSeparator();
+        s.setMaximumSize(new Dimension(Integer.MAX_VALUE, 1));
+        s.setForeground(new Color(218, 218, 218));
+        return s;
     }
 
     private void styleCombo(JComboBox<String> box) {
