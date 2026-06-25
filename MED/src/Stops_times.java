@@ -40,5 +40,23 @@ public class Stops_times {
                 '}';
     }
 
-    
+    public String getTrip_id() {
+        return trip_id;
+    }
+
+    public String getStop_id() {
+        return stop_id;
+    }
+
+    public String getArrival_time() {
+        return arrival_time;
+    }
+
+    public String getDeparture_time() {
+        return departure_time;
+    }
+
+    public int getStop_sequence() {
+        return Integer.parseInt(stop_sequence);
+    }
 }

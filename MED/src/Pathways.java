@@ -28,6 +28,7 @@ public class Pathways {
         this.reversed_signposted_as = pathways[11];
     }
 
+
     @Override
     public String toString() {
         return "Pathways{" +
@@ -45,6 +46,11 @@ public class Pathways {
                 ", reversed_signposted_as='" + reversed_signposted_as + '\'' +
                 '}';
     }
+    public String get_pathway_id(){
+        return from_stop_id;
+    }
+    
+    
 
 
 }

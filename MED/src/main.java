@@ -3,8 +3,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.nio.file.*;
-import java.util.List;
 
 public class main {
     public static void main(String[] args) {
@@ -39,6 +40,18 @@ public class main {
        System.out.println("Nombre d'arrêts à proximité : " + nearbyStops.size());
         for (Stops stop : nearbyStops) {
             System.out.println(stop);
+        }
+
+        String stopTimesFilepath = System.getProperty("user.home") + "/Documents/Data_ITC/IDFM-gtfs/stop_times.txt";
+        Set<String> stopIds = Calculation.getStopIds(nearbyStops);
+        Set<String> activeTripIds = Calculation.getActiveTripIds(stopTimesFilepath, stopIds);
+        System.out.println("Nombre de trips actifs : " + activeTripIds.size());
+
+        Map<String, List<Stops_times>> tripSequences = Calculation.getTripSequences(stopTimesFilepath, activeTripIds);
+        Map<String, String> round0ArrivalTimes = Calculation.getRound0ArrivalTimes(tripSequences, stopIds);
+        System.out.println("Nombre d'arrêts atteignables sans changement : " + round0ArrivalTimes.size());
+        for (Map.Entry<String, String> entry : round0ArrivalTimes.entrySet()) {
+            System.out.println("Stop " + entry.getKey() + " atteignable a " + entry.getValue());
         }
     }
 }
