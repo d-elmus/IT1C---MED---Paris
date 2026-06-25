@@ -23,6 +23,12 @@ public class AppWindow extends JFrame {
     private final JComboBox<String> arriveeBox = new JComboBox<>();
     private final JLabel            resultLabel = new JLabel(" ");
 
+    // Toggle heure départ / arrivée
+    private final JSpinner  timeSpinner  = new JSpinner(new javax.swing.SpinnerDateModel());
+    private final JButton   btnDepartAt  = new JButton("Départ à");
+    private final JButton   btnArriveAt  = new JButton("Arrivée à");
+    private boolean         isDepartTime = true;
+
     // ── Couleurs (identiques à l'original) ────────────────────────
     private static final Color BG_DARK    = new Color(22, 33, 62);
     private static final Color ACCENT     = new Color(227, 5, 28);
@@ -309,26 +315,6 @@ public class AppWindow extends JFrame {
         body.add(departBox);
         body.add(vgap(5));
 
-        JPanel swapRow = new JPanel(new FlowLayout(FlowLayout.CENTER, 0, 0));
-        swapRow.setBackground(BG_SIDEBAR);
-        swapRow.setMaximumSize(new Dimension(Integer.MAX_VALUE, 32));
-        JButton swapBtn = new JButton("⇅");
-        swapBtn.setFont(new Font("Segoe UI", Font.PLAIN, 15));
-        swapBtn.setPreferredSize(new Dimension(32, 32));
-        swapBtn.setForeground(new Color(100, 100, 100));
-        swapBtn.setBackground(Color.WHITE);
-        swapBtn.setBorder(BorderFactory.createLineBorder(new Color(210, 210, 210)));
-        swapBtn.setFocusPainted(false);
-        swapBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-        swapBtn.setToolTipText("Inverser départ / arrivée");
-        swapBtn.addActionListener(e -> {
-            int d = departBox.getSelectedIndex();
-            int a = arriveeBox.getSelectedIndex();
-            departBox.setSelectedIndex(a);
-            arriveeBox.setSelectedIndex(d);
-        });
-        swapRow.add(swapBtn);
-        body.add(swapRow);
         body.add(vgap(5));
 
         body.add(sectionLabel("ARRIVÉE"));
@@ -341,6 +327,10 @@ public class AppWindow extends JFrame {
         sep1.setMaximumSize(new Dimension(Integer.MAX_VALUE, 1));
         sep1.setForeground(new Color(218, 218, 218));
         body.add(sep1);
+        body.add(vgap(16));
+
+        // Sélecteur heure
+        body.add(buildTimeSelector());
         body.add(vgap(16));
 
         // Bouton "Rechercher" (Dijkstra — en attente)
@@ -430,6 +420,70 @@ public class AppWindow extends JFrame {
         // Algorithme Dijkstra — en attente d'implémentation par l'équipe
         resultLabel.setText("<html><b>" + esc(d) + "</b> → <b>" + esc(a) + "</b>"
                 + "<br><br><i>🚧 En attente — Dijkstra en cours d'implémentation.</i></html>");
+    }
+
+    // ── Sélecteur heure ──────────────────────────────────────────
+
+    private JPanel buildTimeSelector() {
+        JPanel panel = new JPanel();
+        panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+        panel.setBackground(BG_SIDEBAR);
+        panel.setAlignmentX(LEFT_ALIGNMENT);
+
+        // Toggle Départ à / Arrivée à
+        JPanel toggle = new JPanel(new GridLayout(1, 2, 0, 0));
+        toggle.setMaximumSize(new Dimension(Integer.MAX_VALUE, 32));
+        toggle.setAlignmentX(LEFT_ALIGNMENT);
+
+        styleToggleBtn(btnDepartAt, true);
+        styleToggleBtn(btnArriveAt, false);
+
+        btnDepartAt.addActionListener(e -> {
+            isDepartTime = true;
+            styleToggleBtn(btnDepartAt, true);
+            styleToggleBtn(btnArriveAt, false);
+        });
+        btnArriveAt.addActionListener(e -> {
+            isDepartTime = false;
+            styleToggleBtn(btnDepartAt, false);
+            styleToggleBtn(btnArriveAt, true);
+        });
+
+        toggle.add(btnDepartAt);
+        toggle.add(btnArriveAt);
+        panel.add(toggle);
+        panel.add(vgap(6));
+
+        // Spinner HH:mm
+        JSpinner.DateEditor editor = new JSpinner.DateEditor(timeSpinner, "HH:mm");
+        timeSpinner.setEditor(editor);
+        timeSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 14));
+        timeSpinner.setMaximumSize(new Dimension(Integer.MAX_VALUE, 36));
+        timeSpinner.setAlignmentX(LEFT_ALIGNMENT);
+
+        // Heure par défaut = maintenant
+        timeSpinner.setValue(new java.util.Date());
+
+        panel.add(timeSpinner);
+        return panel;
+    }
+
+    private void styleToggleBtn(JButton b, boolean selected) {
+        b.setUI(new javax.swing.plaf.basic.BasicButtonUI());
+        b.setFont(new Font("Segoe UI", Font.BOLD, 11));
+        b.setFocusPainted(false);
+        b.setOpaque(true);
+        b.setContentAreaFilled(true);
+        b.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        if (selected) {
+            b.setBackground(ACCENT);
+            b.setForeground(Color.WHITE);
+            b.setBorder(BorderFactory.createLineBorder(ACCENT));
+        } else {
+            b.setBackground(Color.WHITE);
+            b.setForeground(new Color(100, 100, 100));
+            b.setBorder(BorderFactory.createLineBorder(new Color(210, 210, 210)));
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────
