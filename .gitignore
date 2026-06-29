@@ -1,3 +1,9 @@
 *.class
 .DS_Store
 MED/bin/
+scripts/base_complete.sql
+/MED/target
+/Data
+MED/pom.xml
+/.idea
+MED/pom.xml
