@@ -1,0 +1,14 @@
+LOAD DATABASE
+     FROM mysql://root:kawazaki@localhost/mastercamp
+     INTO postgresql://postgres:Xm2uhZtOobmCDp3m@db.lqxsqdkfyxfcxmgzilld.supabase.co:5432/postgres
+
+
+
+ ALTER SCHEMA 'mastercamp' RENAME TO 'public'
+
+ CAST type datetime to timestamptz drop default drop not null,
+      type date to date
+
+ BEFORE LOAD DO
+      $$ drop schema if exists public cascade; $$,
+      $$ create schema public; $$;
