@@ -1,6 +1,12 @@
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Array;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -64,40 +70,55 @@ public class Calculation {
         return stopIds;
     }
 
-    // sera remplace par une requete SQL (SELECT DISTINCT trip_id ...
-    public static Set<String> getActiveTripIds(String filePath, Set<String> nearbyStopIds) {
+    // Requete SQL : tous les trips qui passent par un des arrets proches.
+    // stop_id = ANY(?) remplace le balayage complet de stop_times.txt.
+    public static Set<String> getActiveTripIds(Set<String> nearbyStopIds) {
         Set<String> activeTripIds = new HashSet<>();
-        Path path = Path.of(filePath);
-        try (Stream<String> lines = Files.lines(path)) {
-            lines.skip(1)
-                 .forEach(line -> {
-                     String[] fields = line.split(",", -1);
-                     String stopId = fields[3];
-                     if (nearbyStopIds.contains(stopId)) {
-                         activeTripIds.add(fields[0]);
-                     }
-                 });
-        } catch (IOException e) {
-            System.err.println("An error occurred while reading the file: " + e.getMessage());
+        if (nearbyStopIds.isEmpty()) {
+            return activeTripIds;
+        }
+        String sql = "SELECT DISTINCT trip_id FROM stop_times WHERE stop_id = ANY(?)";
+        try (Connection conn = Database.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            Array ids = conn.createArrayOf("text", nearbyStopIds.toArray());
+            ps.setArray(1, ids);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    activeTripIds.add(rs.getString("trip_id"));
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("Erreur SQL (getActiveTripIds) : " + e.getMessage());
         }
         return activeTripIds;
     }
 
-    // sera remplace par une requete SQL (SELECT * FROM stop_times WHERE ...
-    public static Map<String, List<Stops_times>> getTripSequences(String filePath, Set<String> activeTripIds) {
+    // Requete SQL : toutes les lignes stop_times des trips actifs.
+    // Le tri par stop_sequence est fait en Java 
+    public static Map<String, List<Stops_times>> getTripSequences(Set<String> activeTripIds) {
         Map<String, List<Stops_times>> tripSequences = new HashMap<>();
-        Path path = Path.of(filePath);
-        try (Stream<String> lines = Files.lines(path)) {
-            lines.skip(1)
-                 .forEach(line -> {
-                     String[] fields = line.split(",", -1);
-                     String tripId = fields[0];
-                     if (activeTripIds.contains(tripId)) {
-                         tripSequences.computeIfAbsent(tripId, k -> new ArrayList<>()).add(new Stops_times(fields));
-                     }
-                 });
-        } catch (IOException e) {
-            System.err.println("An error occurred while reading the file: " + e.getMessage());
+        if (activeTripIds.isEmpty()) {
+            return tripSequences;
+        }
+        String sql = "SELECT trip_id, arrival_time, departure_time, stop_id, stop_sequence, "
+                   + "pickup_type, drop_off_type, local_zone_id, stop_headsign, timepoint "
+                   + "FROM stop_times WHERE trip_id = ANY(?)";
+        try (Connection conn = Database.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            Array ids = conn.createArrayOf("text", activeTripIds.toArray());
+            ps.setArray(1, ids);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String[] row = new String[10];
+                    for (int i = 0; i < 10; i++) {
+                        row[i] = rs.getString(i + 1); 
+                    }
+                    tripSequences.computeIfAbsent(row[0], k -> new ArrayList<>())
+                                 .add(new Stops_times(row));
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("Erreur SQL (getTripSequences) : " + e.getMessage());
         }
 
         for (List<Stops_times> sequence : tripSequences.values()) {
@@ -126,25 +147,28 @@ public class Calculation {
         return bestArrivalTime;
     }
 
-    // sera remplace par une requete SQL (SELECT * FROM stops)
-    public static List<Stops> getStopsfromFile(String filePath) {
+    // Requete SQL : tous les arrets. L'ordre des colonnes correspond au
+    // constructeur Stops(String[]) pour pouvoir le reutiliser tel quel.
+    public static List<Stops> getStopsFromDB() {
         List<Stops> stops = new ArrayList<>();
-        Path path = Path.of(filePath);
-        try {
-            List<String> lines = Files.readAllLines(path);
-            if (!lines.isEmpty()) {
-                lines.remove(0); 
+        String sql = "SELECT stop_id, stop_code, stop_name, stop_desc, stop_lon, stop_lat, "
+                   + "zone_id, stop_url, location_type, parent_station, stop_timezone, "
+                   + "level_id, wheelchair_boarding, platform_code FROM stops";
+        try (Connection conn = Database.getConnection();
+             Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery(sql)) {
+            while (rs.next()) {
+                String[] row = new String[14];
+                for (int i = 0; i < 14; i++) {
+                    row[i] = rs.getString(i + 1); 
+                }
+                stops.add(new Stops(row));
             }
-            for (String line : lines) {
-                stops.add(new Stops(line.split(",", -1)));
-            }
-        } catch (IOException e) {
-            System.err.println("An error occurred while reading the file: " + e.getMessage());
+        } catch (SQLException e) {
+            System.err.println("Erreur SQL (getStopsFromDB) : " + e.getMessage());
         }
-
         return stops;
     }
 
- 
 }
 

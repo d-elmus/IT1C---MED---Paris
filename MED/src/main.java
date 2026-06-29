@@ -10,6 +10,7 @@ import javax.swing.*;
 
 public class main {
     public static void main(String[] args) {
+         /*
         // Use system look-and-feel for native buttons/scrollbars
         try {
             UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
@@ -43,22 +44,20 @@ public class main {
         }
         */
        // try with villejuif lat and lon 48.7927° N, 2.3593° E
-       String filepath = System.getProperty("user.home") + "/Documents/Data_ITC/IDFM-gtfs/stops.txt";
        double lat = 48.7927;
        double lon = 2.3593;
-       List<Stops> allStops = Calculation.getStopsfromFile(filepath);
-       List<Stops> nearbyStops = Calculation.getNearbyStops(lat, lon, allStops, 500);
+       List<Stops> allStops = Calculation.getStopsFromDB();
+       List<Stops> nearbyStops = Calculation.getNearbyStops(lat, lon, allStops, 2000);
        System.out.println("Nombre d'arrêts à proximité : " + nearbyStops.size());
         for (Stops stop : nearbyStops) {
             System.out.println(stop);
         }
 
-        String stopTimesFilepath = System.getProperty("user.home") + "/Documents/Data_ITC/IDFM-gtfs/stop_times.txt";
         Set<String> stopIds = Calculation.getStopIds(nearbyStops);
-        Set<String> activeTripIds = Calculation.getActiveTripIds(stopTimesFilepath, stopIds);
+        Set<String> activeTripIds = Calculation.getActiveTripIds(stopIds);
         System.out.println("Nombre de trips actifs : " + activeTripIds.size());
 
-        Map<String, List<Stops_times>> tripSequences = Calculation.getTripSequences(stopTimesFilepath, activeTripIds);
+        Map<String, List<Stops_times>> tripSequences = Calculation.getTripSequences(activeTripIds);
         Map<String, String> round0ArrivalTimes = Calculation.getRound0ArrivalTimes(tripSequences, stopIds);
         System.out.println("Nombre d'arrêts atteignables sans changement : " + round0ArrivalTimes.size());
         for (Map.Entry<String, String> entry : round0ArrivalTimes.entrySet()) {
