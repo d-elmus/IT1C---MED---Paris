@@ -22,4 +22,19 @@ public class Transfers {
                 '}';
     }
 
+    public String getFrom_stop_id() {
+        return from_stop_id;
+    }
+
+    public String getTo_stop_id() {
+        return to_stop_id;
+    }
+
+    public String getTransfer_type() {
+        return transfer_type;
+    }
+
+    public String getMin_transfer_time() {
+        return min_transfer_time;
+    }
 }

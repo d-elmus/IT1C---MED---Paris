@@ -1,13 +1,3 @@
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.nio.file.*;
-import javax.swing.*;
-
 public class main {
     public static void main(String[] args) {
          /*
@@ -43,25 +33,35 @@ public class main {
             System.err.println("An error occurred while reading the file: " + e.getMessage());
         }
         */
-       // try with villejuif lat and lon 48.7927° N, 2.3593° E
-       double lat = 48.7927;
+       // test de l'algo , apres on aura juste la function a appeler
+       double lat = 48.7927;        // origine (ex Villejuif)
        double lon = 2.3593;
-       List<Stops> allStops = Calculation.getStopsFromDB();
-       List<Stops> nearbyStops = Calculation.getNearbyStops(lat, lon, allStops, 2000);
-       System.out.println("Nombre d'arrêts à proximité : " + nearbyStops.size());
-        for (Stops stop : nearbyStops) {
-            System.out.println(stop);
-        }
+       double destLat = 48.8583;    // destination (ex Chatelet)
+       double destLon = 2.3470;
+       double originRadius = 2000;  // rayon autour de l'origine (grand : plein d'arrets de depart possibles)
+       double destRadius = 500;     // rayon autour de la destination (petit : on veut arriver pres du but)
+       String startTime = "08:00:00";
+       int windowMinutes = 30;      // ne garder que les trips partant dans cette fenetre
+       int minTransfer = 0;         // tampon au meme arret (les vrais temps de marche sont dans transfers)
+       int maxChangements = 3;      // nombre max de correspondances a voir avec la connexité
 
-        Set<String> stopIds = Calculation.getStopIds(nearbyStops);
-        Set<String> activeTripIds = Calculation.getActiveTripIds(stopIds);
-        System.out.println("Nombre de trips actifs : " + activeTripIds.size());
+       Journey journey = Calculation.findJourney(lat, lon, destLat, destLon, originRadius, destRadius,
+               startTime, windowMinutes, minTransfer, maxChangements);
 
-        Map<String, List<Stops_times>> tripSequences = Calculation.getTripSequences(activeTripIds);
-        Map<String, String> round0ArrivalTimes = Calculation.getRound0ArrivalTimes(tripSequences, stopIds);
-        System.out.println("Nombre d'arrêts atteignables sans changement : " + round0ArrivalTimes.size());
-        for (Map.Entry<String, String> entry : round0ArrivalTimes.entrySet()) {
-            System.out.println("Stop " + entry.getKey() + " atteignable a " + entry.getValue());
-        }
+       // === Sortie (affichage de test) ===
+       System.out.println("Arrets atteignables : " + journey.arrivalTimes.size());
+       if (journey.destStopId == null) {
+           System.out.println("Aucun trajet trouve (augmenter maxChangements, la fenetre ou le rayon).");
+       } else {
+           System.out.println("Destination : " + journey.destStopId + " a " + journey.destArrivalTime);
+           System.out.println("Arrivee estimee au point de destination : " + journey.destTotalArrivalTime
+                   + "  (dont " + (journey.finalWalkSeconds / 60) + " min de marche finale)");
+           System.out.println("Itineraire (" + journey.destPath.size() + " segments) :");
+           for (Leg leg : journey.destPath) {
+               String mode = leg.aPied ? "marche a pied" : "trip " + leg.tripId;
+               System.out.println("  " + leg.fromStop + " (" + leg.departTime + ")  --" + mode
+                       + "-->  " + leg.toStop + " (" + leg.arriveTime + ")");
+           }
+       }
     }
 }
