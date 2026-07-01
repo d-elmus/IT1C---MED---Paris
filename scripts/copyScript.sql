@@ -1,0 +1,10 @@
+\copy agency FROM 'C:/Users/pokem/Documents/math/IT1C---MED---Paris/Data/agency.txt' WITH DELIMITER ',' CSV HEADER;
+\copy calendar FROM 'C:/Users/pokem/Documents/math/IT1C---MED---Paris/Data/calendar.txt' WITH DELIMITER ',' CSV HEADER;
+\copy calendar_dates FROM 'C:/Users/pokem/Documents/math/IT1C---MED---Paris/Data/calendar_dates.txt' WITH DELIMITER ',' CSV HEADER;
+\copy stops FROM 'C:/Users/pokem/Documents/math/IT1C---MED---Paris/Data/stops.txt' WITH DELIMITER ',' CSV HEADER;
+\copy routes FROM 'C:/Users/pokem/Documents/math/IT1C---MED---Paris/Data/routes.txt' WITH DELIMITER ',' CSV HEADER;
+\copy trips FROM 'C:/Users/pokem/Documents/math/IT1C---MED---Paris/Data/trips.txt' WITH DELIMITER ',' CSV HEADER;
+\copy pathways FROM 'C:/Users/pokem/Documents/math/IT1C---MED---Paris/Data/pathways.txt' WITH DELIMITER ',' CSV HEADER;
+\copy transfers FROM 'C:/Users/pokem/Documents/math/IT1C---MED---Paris/Data/transfers.txt' WITH DELIMITER ',' CSV HEADER;
+\copy stop_extensions FROM 'C:/Users/pokem/Documents/math/IT1C---MED---Paris/Data/stop_extensions.txt' WITH DELIMITER ',' CSV HEADER;
+\copy stop_times FROM 'C:/Users/pokem/Documents/math/IT1C---MED---Paris/Data/stop_times.txt' WITH DELIMITER ',' CSV HEADER;

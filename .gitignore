@@ -2,3 +2,9 @@
 .DS_Store
 MED/bin/
 db.properties
+scripts/base_complete.sql
+/MED/target
+/Data
+MED/pom.xml
+/.idea
+MED/pom.xml
