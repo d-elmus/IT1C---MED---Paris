@@ -15,6 +15,7 @@ public class MapPanel extends JPanel {
     private int zoom = 12;
 
     private List<MetroLoader.StationInfo> stations = new ArrayList<>();
+    private List<double[]> routePoints = new ArrayList<>();
     private final Map<String, BufferedImage> tileCache = new ConcurrentHashMap<>();
     private final Set<String> pendingTiles = ConcurrentHashMap.newKeySet();
     private final ExecutorService tileLoader = Executors.newFixedThreadPool(4);
@@ -132,6 +133,16 @@ public class MapPanel extends JPanel {
         }
     }
 
+    public void setRoute(List<double[]> points) {
+        this.routePoints = new ArrayList<>(points);
+        repaint();
+    }
+
+    public void clearRoute() {
+        this.routePoints = new ArrayList<>();
+        repaint();
+    }
+
     public void shutdown() {
         tileLoader.shutdownNow();
     }
@@ -172,6 +183,31 @@ public class MapPanel extends JPanel {
                     requestTile(zoom, tx, ty);
                 }
             }
+        }
+
+        // Route overlay
+        if (routePoints.size() >= 2) {
+            g2.setColor(new Color(59, 130, 246, 60));
+            g2.setStroke(new BasicStroke(9f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+            for (int i = 0; i < routePoints.size() - 1; i++) {
+                int[] p1 = latLonToPixel(routePoints.get(i)[0],   routePoints.get(i)[1],   w, h);
+                int[] p2 = latLonToPixel(routePoints.get(i+1)[0], routePoints.get(i+1)[1], w, h);
+                g2.drawLine(p1[0], p1[1], p2[0], p2[1]);
+            }
+            g2.setColor(new Color(37, 99, 235));
+            g2.setStroke(new BasicStroke(4f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+            for (int i = 0; i < routePoints.size() - 1; i++) {
+                int[] p1 = latLonToPixel(routePoints.get(i)[0],   routePoints.get(i)[1],   w, h);
+                int[] p2 = latLonToPixel(routePoints.get(i+1)[0], routePoints.get(i+1)[1], w, h);
+                g2.drawLine(p1[0], p1[1], p2[0], p2[1]);
+            }
+            g2.setStroke(new BasicStroke(1f));
+            int[] pS = latLonToPixel(routePoints.get(0)[0], routePoints.get(0)[1], w, h);
+            int[] pE = latLonToPixel(routePoints.get(routePoints.size()-1)[0], routePoints.get(routePoints.size()-1)[1], w, h);
+            g2.setColor(Color.WHITE); g2.fillOval(pS[0]-8, pS[1]-8, 17, 17);
+            g2.setColor(new Color(34, 197, 94)); g2.fillOval(pS[0]-7, pS[1]-7, 15, 15);
+            g2.setColor(Color.WHITE); g2.fillOval(pE[0]-8, pE[1]-8, 17, 17);
+            g2.setColor(new Color(239, 68, 68)); g2.fillOval(pE[0]-7, pE[1]-7, 15, 15);
         }
 
         // Station markers
@@ -261,6 +297,14 @@ public class MapPanel extends JPanel {
     }
 
     // ── Coordinate helpers ────────────────────────────────────────
+
+    private int[] latLonToPixel(double lat, double lon, int w, int h) {
+        double cTX = lonToTileX(centerLon, zoom);
+        double cTY = latToTileY(centerLat, zoom);
+        int px = (int) Math.round((lonToTileX(lon, zoom) - cTX) * 256 + w / 2.0);
+        int py = (int) Math.round((latToTileY(lat, zoom) - cTY) * 256 + h / 2.0);
+        return new int[]{px, py};
+    }
 
     private int[] stationToPixel(MetroLoader.StationInfo s, int w, int h) {
         double cTX = lonToTileX(centerLon, zoom);
