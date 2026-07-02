@@ -18,7 +18,7 @@ public class Calculation {
         return R * c;
     }
 
-    public static List<Stops> getNearbyStops(double lat1, double lon1, List<Stops> allStops, double radiusMeters) {
+    /*public static List<Stops> getNearbyStops(double lat1, double lon1, List<Stops> allStops, double radiusMeters) {
         List<Stops> result = new ArrayList<>();
         for (Stops s : allStops) {
             String stopLat = s.getStop_lat();
@@ -68,7 +68,7 @@ public class Calculation {
 
         return stops;
     }
-
+*/
  
 }
 

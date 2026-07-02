@@ -1,13 +1,18 @@
 //service_id,date,exception_type
-public class Calendar_dates {
-    private String service_id;
-    private String date;
-    private String exception_type;
+import java.sql.Date;
 
-    public Calendar_dates(String[] calendar_dates) {
-        this.service_id = calendar_dates[0];
-        this.date = calendar_dates[1];
-        this.exception_type = calendar_dates[2];
+public class Calendar_dates {
+
+    private int service_id;
+    private Date date;
+    private int exception_type;
+
+    public Calendar_dates(int service_id, Date date,
+                         int exception_type) {
+
+        this.service_id = service_id;
+        this.date = date;
+        this.exception_type = exception_type;
     }
 
     @Override
