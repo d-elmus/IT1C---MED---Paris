@@ -1,6 +1,3 @@
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.sql.Array;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -14,7 +11,6 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.stream.Stream;
 
 public class Calculation {
     // Vitesse de marche a pied pour estimer le temps de marche final (m/s, ~5 km/h).
@@ -37,7 +33,7 @@ public class Calculation {
         return (int) Math.round(haversine(lat1, lon1, lat2, lon2) / WALK_SPEED_MPS);
     }
 
-// converti en Set plus facile pour chercher stop_times
+    // converti en Set plus facile pour chercher stop_times
     public static Set<String> getStopIds(List<Stops> stops) {
         Set<String> stopIds = new HashSet<>();
         for (Stops s : stops) {
@@ -46,62 +42,67 @@ public class Calculation {
         return stopIds;
     }
 
-    // Requete SQL : tous les trips qui passent par un des arrets proches.
-    // stop_id = ANY(?) remplace le balayage complet de stop_times.txt.
-    public static Set<String> getActiveTripIds(Set<String> nearbyStopIds) {
-        Set<String> activeTripIds = new HashSet<>();
-        if (nearbyStopIds.isEmpty()) {
-            return activeTripIds;
+    // Charge dans tripCache les sequences des trips qui passent par un des stopIds ET qui ne sont
+    // pas deja charges (cache). Deux requetes : (a) les trip_id candidats, (b) les stop_times des
+    // SEULS nouveaux trips -> on ne re-telecharge jamais un trip deja vu (gros gain de volume).
+    public static void loadTripsThrough(Connection conn, Set<String> stopIds, String fromTime, String toTime,
+            Map<String, List<Stops_times>> tripCache, Set<String> loadedTripIds) {
+        if (stopIds.isEmpty()) {
+            return;
         }
-        String sql = "SELECT DISTINCT trip_id FROM stop_times WHERE stop_id = ANY(?)";
-        try (Connection conn = Database.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
-            Array ids = conn.createArrayOf("text", nearbyStopIds.toArray());
-            ps.setArray(1, ids);
+        // (a) trip_id qui passent par un des arrets, avec un depart dans l'horizon [fromTime, toTime]
+        Set<String> candidates = new HashSet<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT DISTINCT trip_id FROM stop_times "
+              + "WHERE stop_id = ANY(?) AND departure_time BETWEEN ? AND ?")) {
+            ps.setArray(1, conn.createArrayOf("text", stopIds.toArray()));
+            ps.setString(2, fromTime);
+            ps.setString(3, toTime);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    activeTripIds.add(rs.getString("trip_id"));
+                    candidates.add(rs.getString(1));
                 }
             }
         } catch (SQLException e) {
-            System.err.println("Erreur SQL (getActiveTripIds) : " + e.getMessage());
+            System.err.println("Erreur SQL (loadTripsThrough/ids) : " + e.getMessage());
+            return;
         }
-        return activeTripIds;
-    }
 
-    // Requete SQL : toutes les lignes stop_times des trips actifs.
-    // Le tri par stop_sequence est fait en Java 
-    public static Map<String, List<Stops_times>> getTripSequences(Set<String> activeTripIds) {
-        Map<String, List<Stops_times>> tripSequences = new HashMap<>();
-        if (activeTripIds.isEmpty()) {
-            return tripSequences;
+        // Cache : ne garder que les trips pas encore charges.
+        candidates.removeAll(loadedTripIds);
+        if (candidates.isEmpty()) {
+            return;
         }
+
+        // (b) stop_times des NOUVEAUX trips uniquement
         String sql = "SELECT trip_id, arrival_time, departure_time, stop_id, stop_sequence, "
                    + "pickup_type, drop_off_type, local_zone_id, stop_headsign, timepoint "
                    + "FROM stop_times WHERE trip_id = ANY(?)";
-        try (Connection conn = Database.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
-            Array ids = conn.createArrayOf("text", activeTripIds.toArray());
-            ps.setArray(1, ids);
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setArray(1, conn.createArrayOf("text", candidates.toArray()));
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     String[] row = new String[10];
                     for (int i = 0; i < 10; i++) {
-                        row[i] = rs.getString(i + 1); 
+                        row[i] = rs.getString(i + 1);
                     }
-                    tripSequences.computeIfAbsent(row[0], k -> new ArrayList<>())
-                                 .add(new Stops_times(row));
+                    tripCache.computeIfAbsent(row[0], k -> new ArrayList<>()).add(new Stops_times(row));
                 }
             }
         } catch (SQLException e) {
-            System.err.println("Erreur SQL (getTripSequences) : " + e.getMessage());
+            System.err.println("Erreur SQL (loadTripsThrough/seq) : " + e.getMessage());
         }
 
-        for (List<Stops_times> sequence : tripSequences.values()) {
-            sequence.sort(Comparator.comparingInt(Stops_times::getStop_sequence));
+        // Trier les nouvelles sequences par stop_sequence et les marquer comme chargees.
+        for (String t : candidates) {
+            List<Stops_times> seq = tripCache.get(t);
+            if (seq != null) {
+                seq.sort(Comparator.comparingInt(Stops_times::getStop_sequence));
+            }
+            loadedTripIds.add(t);
         }
-        return tripSequences;
     }
+
     public static int toSeconds(String hms) { // Convertit "HH:MM:SS" en secondes depuis minuit. Retourne -1 si format invalide.
         if (hms == null || hms.isEmpty()) {
             return -1;
@@ -182,7 +183,7 @@ public class Calculation {
                 int readyAt = toSeconds(arrivalTimes.get(boarding.getStop_id())) + minTransferSeconds;
                 int depSeconds = toSeconds(boarding.getDeparture_time());
                 if (depSeconds < 0 || depSeconds < readyAt) {
-                    continue;                       
+                    continue;
                 }
                 for (int j = i + 1; j < sequence.size(); j++) {
                     Stops_times reached = sequence.get(j);
@@ -225,7 +226,7 @@ public class Calculation {
                 if ("3".equals(t.getTransfer_type())) {
                     continue;                       // correspondance impossible
                 }
-                int cost = 0;                       
+                int cost = 0;
                 String mtt = t.getMin_transfer_time();
                 if (mtt != null && !mtt.isEmpty()) {
                     try { cost = Integer.parseInt(mtt.trim()); } catch (NumberFormatException ignored) {}
@@ -264,68 +265,82 @@ public class Calculation {
     //          tampon de correspondance au meme arret (s), nb max de changements.
     // Sortie : un Journey = meilleur arret de destination (stop_id) + le chemin (liste de Leg),
     //          plus tous les arrets atteignables et les legs pour reconstruire n'importe quel chemin.
+    // Perf : une seule connexion SQL pour tout le calcul + cache de trips (on ne recharge jamais
+    //        un trip deja charge d'une ronde a l'autre).
     public static Journey findJourney(double originLat, double originLon,
             double destLat, double destLon, double originRadius, double destRadius,
-            String startTime, int windowMinutes, int minTransferSeconds, int maxChangements) {
+            String startTime, int windowMinutes, int minTransferSeconds, int maxChangements,
+            int horizonMinutes) {
 
-        // 1. Arrets de depart proches de l'origine, chacun atteint a startTime + marche (point -> arret)
-        List<Stops> originStops = getNearbyStopsFromDB(originLat, originLon, originRadius);
-        int startSec = toSeconds(startTime);
-        Map<String, String> originArrivals = new HashMap<>();
-        for (Stops s : originStops) {
-            int walk = walkSeconds(originLat, originLon,
-                    Double.parseDouble(s.getStop_lat()), Double.parseDouble(s.getStop_lon()));
-            originArrivals.put(s.getStop_id(), fromSeconds(startSec + walk));
-        }
-        Set<String> startStopIds = originArrivals.keySet();
-
-        // 2. Trips passant par ces arrets + leurs sequences d'arrets
-        Map<String, List<Stops_times>> tripSequences = getTripSequences(getActiveTripIds(startStopIds));
-
-        // 3. Round 0 (sans changement) puis correspondances a pied
+        Map<String, String> arrivalTimes = new HashMap<>();
         Map<String, Leg> legs = new HashMap<>();
-        Map<String, String> arrivalTimes =
-                getRound0ArrivalTimes(tripSequences, originArrivals, startTime, windowMinutes, legs);
-        Set<String> marked = new HashSet<>(arrivalTimes.keySet());
-        marked.addAll(applyTransfers(arrivalTimes, legs, marked, getTransfers(marked)));
-
-        // 4. Rondes suivantes : chaque ronde ajoute une correspondance (un trip de plus)
-        for (int round = 1; round <= maxChangements && !marked.isEmpty(); round++) {
-            Map<String, List<Stops_times>> seq = getTripSequences(getActiveTripIds(marked));
-            Set<String> improved = runRound(seq, arrivalTimes, legs, marked, minTransferSeconds);
-            improved.addAll(applyTransfers(arrivalTimes, legs, improved, getTransfers(improved)));
-            marked = improved;
-        }
-
-        // 5. Destination : parmi les arrets proches, on choisit celui qui minimise le TEMPS TOTAL
-        //    = arrivee transit + marche finale (arret -> point de destination).
-        List<Stops> destStops = getNearbyStopsFromDB(destLat, destLon, destRadius);
         String bestDest = null;
         String bestArrival = null;              // heure d'arrivee transit a l'arret choisi
         int bestTotal = Integer.MAX_VALUE;      // arrivee transit + marche finale, en secondes
-        for (Stops s : destStops) {
-            String arr = arrivalTimes.get(s.getStop_id());
-            if (arr == null) {
-                continue;                       // arret non atteint par le transit
+
+        // Une seule connexion pour tout le calcul (au lieu d'une par requete).
+        try (Connection conn = Database.getConnection()) {
+
+            // 1. Arrets d'origine, chacun atteint a startTime + marche (point -> arret)
+            List<Stops> originStops = getNearbyStopsFromDB(conn, originLat, originLon, originRadius);
+            int startSec = toSeconds(startTime);
+            Map<String, String> originArrivals = new HashMap<>();
+            for (Stops s : originStops) {
+                int walk = walkSeconds(originLat, originLon,
+                        Double.parseDouble(s.getStop_lat()), Double.parseDouble(s.getStop_lon()));
+                originArrivals.put(s.getStop_id(), fromSeconds(startSec + walk));
             }
-            int total = toSeconds(arr) + walkSeconds(destLat, destLon,
-                    Double.parseDouble(s.getStop_lat()), Double.parseDouble(s.getStop_lon()));
-            if (total < bestTotal) {
-                bestTotal = total;
-                bestDest = s.getStop_id();
-                bestArrival = arr;
+
+            // Cache cumulatif des trips : on ne recharge jamais un trip deja charge.
+            Map<String, List<Stops_times>> tripCache = new HashMap<>();
+            Set<String> loadedTripIds = new HashSet<>();
+
+            // Horizon : on ne considere que les trips partant dans [startTime, startTime + horizonMinutes].
+            String horizonEnd = fromSeconds(startSec + horizonMinutes * 60);
+
+            // 2 + 3. Trips autour de l'origine, round 0, puis correspondances a pied
+            loadTripsThrough(conn, originArrivals.keySet(), startTime, horizonEnd, tripCache, loadedTripIds);
+            arrivalTimes.putAll(getRound0ArrivalTimes(tripCache, originArrivals, startTime, windowMinutes, legs));
+            Set<String> marked = new HashSet<>(arrivalTimes.keySet());
+            marked.addAll(applyTransfers(arrivalTimes, legs, marked, getTransfers(conn, marked)));
+
+            // 4. Rondes suivantes : chaque ronde ajoute une correspondance (un trip de plus).
+            //    Arret anticipe : la boucle s'arrete des qu'une ronde n'ameliore plus rien (marked vide).
+            for (int round = 1; round <= maxChangements && !marked.isEmpty(); round++) {
+                loadTripsThrough(conn, marked, startTime, horizonEnd, tripCache, loadedTripIds);   // seulement les NOUVEAUX trips, dans l'horizon
+                Set<String> improved = runRound(tripCache, arrivalTimes, legs, marked, minTransferSeconds);
+                improved.addAll(applyTransfers(arrivalTimes, legs, improved, getTransfers(conn, improved)));
+                marked = improved;
             }
+
+            // 5. Destination : arret proche minimisant le TEMPS TOTAL (transit + marche finale).
+            List<Stops> destStops = getNearbyStopsFromDB(conn, destLat, destLon, destRadius);
+            for (Stops s : destStops) {
+                String arr = arrivalTimes.get(s.getStop_id());
+                if (arr == null) {
+                    continue;                       // arret non atteint par le transit
+                }
+                int total = toSeconds(arr) + walkSeconds(destLat, destLon,
+                        Double.parseDouble(s.getStop_lat()), Double.parseDouble(s.getStop_lon()));
+                if (total < bestTotal) {
+                    bestTotal = total;
+                    bestDest = s.getStop_id();
+                    bestArrival = arr;
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("Erreur SQL (findJourney) : " + e.getMessage());
         }
+
         String destTotal = (bestDest == null) ? null : fromSeconds(bestTotal);
         int finalWalkSeconds = (bestDest == null) ? 0 : bestTotal - toSeconds(bestArrival);
         List<Leg> destPath = (bestDest == null) ? new ArrayList<>() : reconstructPath(bestDest, legs);
         return new Journey(arrivalTimes, legs, bestDest, bestArrival, destTotal, finalWalkSeconds, destPath);
     }
 
-    // Requete SQL : SEULEMENT les arrets dans le rayon, filtres cote SQL par une
-    // bounding box (carre lat/lon) puis affines au cercle exact par haversine en Java.
-    // Evite de charger toute la table stops puis de filtrer cote Java donc meilleur performance.
-    public static List<Stops> getNearbyStopsFromDB(double lat, double lon, double radiusMeters) {
+    // Requete SQL : SEULEMENT les arrets dans le rayon, filtres cote SQL par une bounding box
+    // (carre lat/lon) puis affines au cercle exact par haversine en Java. Utilise la connexion fournie.
+    public static List<Stops> getNearbyStopsFromDB(Connection conn, double lat, double lon, double radiusMeters) {
         List<Stops> result = new ArrayList<>();
 
         // Bounding box en degres autour du point.
@@ -333,14 +348,12 @@ public class Calculation {
         double dLon = radiusMeters / (111320.0 * Math.cos(Math.toRadians(lat))); // corrige par la latitude
 
         // stop_lat / stop_lon sont des colonnes numeriques : comparaison directe, sans cast.
-        // Les lignes a lat/lon NULL ne matchent pas le BETWEEN (ecartees sans erreur).
         String sql = "SELECT stop_id, stop_code, stop_name, stop_desc, stop_lon, stop_lat, "
                    + "zone_id, stop_url, location_type, parent_station, stop_timezone, "
                    + "level_id, wheelchair_boarding, platform_code FROM stops "
                    + "WHERE stop_lat BETWEEN ? AND ? "
                    + "AND stop_lon BETWEEN ? AND ?";
-        try (Connection conn = Database.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setDouble(1, lat - dLat);
             ps.setDouble(2, lat + dLat);
             ps.setDouble(3, lon - dLon);
@@ -368,16 +381,15 @@ public class Calculation {
     }
 
     // Requete SQL : les correspondances au depart des arrets donnes, indexees par from_stop_id.
-    // from_stop_id = ANY(?) : on ne charge que les transferts utiles (une seule requete batchee).
-    public static Map<String, List<Transfers>> getTransfers(Set<String> fromStopIds) {
+    // from_stop_id = ANY(?) : on ne charge que les transferts utiles. Utilise la connexion fournie.
+    public static Map<String, List<Transfers>> getTransfers(Connection conn, Set<String> fromStopIds) {
         Map<String, List<Transfers>> transfersByFrom = new HashMap<>();
         if (fromStopIds.isEmpty()) {
             return transfersByFrom;
         }
         String sql = "SELECT from_stop_id, to_stop_id, transfer_type, min_transfer_time "
                    + "FROM transfers WHERE from_stop_id = ANY(?)";
-        try (Connection conn = Database.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
             Array ids = conn.createArrayOf("text", fromStopIds.toArray());
             ps.setArray(1, ids);
             try (ResultSet rs = ps.executeQuery()) {
@@ -396,4 +408,3 @@ public class Calculation {
         return transfersByFrom;
     }
 }
-

@@ -44,9 +44,10 @@ public class main {
        int windowMinutes = 30;      // ne garder que les trips partant dans cette fenetre
        int minTransfer = 0;         // tampon au meme arret (les vrais temps de marche sont dans transfers)
        int maxChangements = 3;      // nombre max de correspondances a voir avec la connexité
+       int horizonMinutes = 120;    // budget temps total : ne charge que les trips partant dans ce delai
 
        Journey journey = Calculation.findJourney(lat, lon, destLat, destLon, originRadius, destRadius,
-               startTime, windowMinutes, minTransfer, maxChangements);
+               startTime, windowMinutes, minTransfer, maxChangements, horizonMinutes);
 
        // === Sortie (affichage de test) ===
        System.out.println("Arrets atteignables : " + journey.arrivalTimes.size());
