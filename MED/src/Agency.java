@@ -8,15 +8,17 @@ public class Agency {
     private String agency_email;
     private String agency_fare_url;
 
-    public Agency(String[] agencies) {
-        this.agency_id = agencies[0];
-        this.agency_name = agencies[1];
-        this.agency_url = agencies[2];
-        this.agency_timezone = agencies[3];
-        this.agency_lang = agencies[4];
-        this.agency_phone = agencies[5];
-        this.agency_email = agencies[6];
-        this.agency_fare_url = agencies[7];
+    public Agency(String agency_id, String agency_name, String agency_url,
+                  String agency_timezone, String agency_lang,
+                  String agency_phone, String agency_email) {
+
+        this.agency_id = agency_id;
+        this.agency_name = agency_name;
+        this.agency_url = agency_url;
+        this.agency_timezone = agency_timezone;
+        this.agency_lang = agency_lang;
+        this.agency_phone = agency_phone;
+        this.agency_email = agency_email;
     }
 
 
