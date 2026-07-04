@@ -16,38 +16,31 @@ public class GraphBuilder {
         }
 
         String sql = """
-                SELECT DISTINCT from_stop, to_stop
-            FROM (
-                SELECT
-                    stop_id AS from_stop,
-                    LEAD(stop_id) OVER (
-                        PARTITION BY trip_id
-                        ORDER BY stop_sequence
-                    ) AS to_stop
-                FROM stop_times
-            ) t
-            WHERE to_stop IS NOT NULL;
-            """;
+        WITH station_stop_times AS (SELECT st.trip_id, st.stop_sequence, COALESCE(s.parent_station, s.stop_id) AS station_id
+        FROM stop_times st JOIN stops s ON st.stop_id = s.stop_id)
+        SELECT distinct station_id AS from_station,
+        LEAD(station_id) OVER (PARTITION BY trip_id ORDER BY stop_sequence) AS to_station
+        FROM station_stop_times;""";
 
         PreparedStatement ps = loader.getConnection().prepareStatement(sql);
         ResultSet rs = ps.executeQuery();
 
         while (rs.next()) {
+            String toStation = rs.getString("to_station");
 
-            String toStop = rs.getString("to_stop");
-
-            if (toStop == null) {
+            if (toStation == null) {
                 continue;
             }
 
-            Vertice from = graph.getVertice(rs.getString("from_stop"));
-            Vertice to = graph.getVertice(toStop);
+            Vertice from = graph.getVertice(rs.getString("from_station"));
+            Vertice to = graph.getVertice(toStation);
+
 
             if (from != null && to != null) {
                 from.addEdge(new Edge(to));
             }
         }
-
+        graph.removeEmptyVertices();
         return graph;
     }
 
@@ -68,7 +61,7 @@ public class GraphBuilder {
 
                 for (Edge e : v.getEdges()) {
 
-                    System.out.println("    -> " +
+                    System.out.println("  -> " +
                             e.getDestination().getStops().getStop_name());
                 }
 

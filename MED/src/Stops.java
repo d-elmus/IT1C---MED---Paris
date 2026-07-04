@@ -71,6 +71,10 @@ public class Stops {
         return stop_lon;
     }
 
-    public String getStop_name(){ return this.stop_name;}
+    public String getParent_station(){ return this.parent_station;}
+
+    public String getStop_name() {
+        return this.stop_name;
+    }
 }
 
