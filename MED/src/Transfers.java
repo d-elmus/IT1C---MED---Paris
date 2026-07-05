@@ -15,12 +15,11 @@ public class Transfers {
         this.min_transfer_time = min_transfer_time;
     }
 
-    public String getFrom_stop_id(){
-        return this.from_stop_id;
-    }
-
-    public String getTo_stop_id(){
-        return this.to_stop_id;
+    public Transfers(String[] row) {
+        this.from_stop_id   = row[0];
+        this.to_stop_id     = row[1];
+        this.transfer_type  = row[2];
+        this.min_transfer_time = row[3];
     }
 
     @Override

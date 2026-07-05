@@ -62,10 +62,10 @@ public class AppWindow extends JFrame {
                 int w = getWidth(), h = getHeight();
                 // Map fills everything
                 mapPanel.setBounds(0, 0, w, h);
-                // Card: 340px wide, margin 24px from left and top/bottom
-                Component card = getComponent(0); // card is on top layer
-                int cardW = 340;
-                int cardH = Math.min(h - 48, 720);
+                // Card: max 400px, s'adapte si la fenêtre est trop étroite
+                Component card = getComponent(0);
+                int cardW = Math.min(400, w - 48);
+                int cardH = Math.min(h - 48, 780);
                 int cardX = 24;
                 int cardY = (h - cardH) / 2;
                 card.setBounds(cardX, cardY, cardW, cardH);
@@ -302,6 +302,12 @@ public class AppWindow extends JFrame {
             departBox.addItem(s.name);
             arriveeBox.addItem(s.name);
         }
+        // Fige la largeur préférée des combos pour éviter l'expansion au chargement
+        Dimension d = new Dimension(1, departBox.getPreferredSize().height);
+        departBox.setPreferredSize(d);
+        arriveeBox.setPreferredSize(d);
+        departBox.revalidate();
+        arriveeBox.revalidate();
     }
 
     // ── Carte flottante principale ────────────────────────────────
@@ -328,7 +334,14 @@ public class AppWindow extends JFrame {
         shadow.setOpaque(false);
         shadow.setBorder(new EmptyBorder(8, 8, 8, 8));
 
-        JPanel inner = new JPanel();
+        JPanel inner = new JPanel() {
+            @Override
+            public Dimension getPreferredSize() {
+                Dimension d = super.getPreferredSize();
+                if (getParent() != null) d.width = getParent().getWidth();
+                return d;
+            }
+        };
         inner.setOpaque(false);
         inner.setLayout(new BoxLayout(inner, BoxLayout.Y_AXIS));
         inner.setBorder(new EmptyBorder(20, 20, 20, 20));
@@ -721,9 +734,9 @@ public class AppWindow extends JFrame {
             protected Object[] doInBackground() throws Exception {
                 Journey j = Calculation.findJourney(
                         oLat, oLon, dLat, dLon,
-                        600, 400,
-                        startTime, 30,
-                        120, 4, 120);
+                        2000, 500,
+                        startTime, 60,
+                        120, 5, 180);
                 List<double[]> route = buildFullRoute(j);
                 return new Object[]{j, route};
             }

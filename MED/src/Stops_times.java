@@ -12,6 +12,19 @@ public class Stops_times {
     private String stop_headsign;
     private boolean timepoint;
 
+    public Stops_times(String[] row) {
+        this.trip_id        = row[0];
+        this.arrival_time   = row[1];
+        this.departure_time = row[2];
+        this.stop_id        = row[3];
+        this.stop_sequence  = row[4] != null ? Integer.parseInt(row[4]) : 0;
+        this.pickup_type    = "1".equals(row[5]);
+        this.drop_off_type  = "1".equals(row[6]);
+        this.local_zone_id  = row[7] != null ? Integer.parseInt(row[7]) : 0;
+        this.stop_headsign  = row[8];
+        this.timepoint      = "1".equals(row[9]);
+    }
+
     public Stops_times(String trip_id, int stop_sequence, String arrival_time, String stop_id, String departure_time, boolean pickup_type, boolean drop_off_type,
                      int local_zone_id, String stop_headsign, boolean timepoint) {
 
@@ -60,6 +73,6 @@ public class Stops_times {
     }
 
     public int getStop_sequence() {
-        return Integer.parseInt(stop_sequence);
+        return stop_sequence;
     }
 }

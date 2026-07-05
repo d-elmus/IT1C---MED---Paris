@@ -16,6 +16,23 @@ public class Stops {
     private String stop_timezone;
 
 
+    public Stops(String[] row) {
+        this.stop_id             = row[0];
+        this.stop_code           = row[1];
+        this.stop_name           = row[2];
+        this.stop_desc           = row[3];
+        this.stop_lon            = row[4];
+        this.stop_lat            = row[5];
+        this.zone_id             = row[6];
+        this.stop_url            = row[7];
+        this.location_type       = row[8];
+        this.parent_station      = row[9];
+        this.stop_timezone       = row[10];
+        this.level_id            = row[11] != null ? Integer.parseInt(row[11]) : 0;
+        this.wheelchair_boarding = row[12] != null ? Integer.parseInt(row[12]) : 0;
+        this.plateform_code      = row[13];
+    }
+
     public Stops(String stop_id, int level_id, String zone_id,
                  String stop_code, String stop_name, String stop_desc,
                  String stop_lat, String stop_lon, String plateform_code,
