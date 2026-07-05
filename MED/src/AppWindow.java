@@ -17,10 +17,16 @@ public class AppWindow extends JFrame {
     private final JComboBox<String> arriveeBox = new JComboBox<>();
     private final JLabel            resultLabel = new JLabel(" ");
 
+    // Bouton "Voir les détails →" + contenu HTML complet du dernier résultat
+    private final JButton detailBtn  = new JButton("Voir les détails →");
+    private String        detailHtml = null;
+
     // Station name → coordonnées (pour appel RAPTOR)
-    private final Map<String, MetroLoader.StationInfo> stationMap = new HashMap<>();
+    private final Map<String, MetroLoader.StationInfo> stationMap  = new HashMap<>();
     // stop_id → [lat, lon] (pour tracer l'itinéraire sur la carte)
-    private final Map<String, double[]> stopCoords = new HashMap<>();
+    private final Map<String, double[]>                stopCoords  = new HashMap<>();
+    // stop_id → nom lisible (pour le détail itinéraire)
+    private final Map<String, String>                  stopIdToName = new HashMap<>();
 
     private final JSpinner timeSpinner = new JSpinner(new javax.swing.SpinnerDateModel());
     private final JButton  btnDepartAt = new JButton("Départ à");
@@ -135,6 +141,7 @@ public class AppWindow extends JFrame {
 
         Map<String, double[]> latLonByName = new LinkedHashMap<>();
         stopCoords.clear();
+        stopIdToName.clear();
 
         try (Connection conn = Database.getConnection();
              PreparedStatement ps = conn.prepareStatement(sqlAll);
@@ -144,8 +151,8 @@ public class AppWindow extends JFrame {
                 String name = fixEncoding(rs.getString("stop_name"));
                 double lat  = rs.getDouble("lat");
                 double lon  = rs.getDouble("lon");
-                if (id != null)   stopCoords.put(id, new double[]{lat, lon});
-                // Déduplique par nom en gardant la première occurrence
+                if (id != null)   { stopCoords.put(id, new double[]{lat, lon}); }
+                if (id != null && name != null) stopIdToName.put(id, name);
                 if (name != null) latLonByName.putIfAbsent(name, new double[]{lat, lon});
             }
         }
@@ -376,6 +383,19 @@ public class AppWindow extends JFrame {
         inner.add(vgap(14));
 
         inner.add(buildResultCard());
+
+        detailBtn.setUI(new javax.swing.plaf.basic.BasicButtonUI());
+        detailBtn.setFont(new Font("Segoe UI", Font.BOLD, 11));
+        detailBtn.setForeground(BLUE_DARK);
+        detailBtn.setOpaque(false);
+        detailBtn.setContentAreaFilled(false);
+        detailBtn.setBorderPainted(false);
+        detailBtn.setFocusPainted(false);
+        detailBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        detailBtn.setAlignmentX(LEFT_ALIGNMENT);
+        detailBtn.setVisible(false);
+        detailBtn.addActionListener(e -> ouvrirDetail());
+        inner.add(detailBtn);
         inner.add(vgap(18));
 
         inner.add(buildDivider());
@@ -384,14 +404,11 @@ public class AppWindow extends JFrame {
         // ── OUTILS section ─────────────────────────────────────────
         inner.add(sectionLabel("OUTILS"));
         inner.add(vgap(8));
-        inner.add(boutonEnAttente("Arbre Couvrant Minimal (Kruskal)",
-                "Kruskal : arbre couvrant de poids minimal"));
+        inner.add(creerBoutonOutil("Arbre Couvrant Minimal (Kruskal)", this::lancerKruskal));
         inner.add(vgap(6));
-        inner.add(boutonEnAttente("Vérifier la connexité (BFS)",
-                "BFS : vérification de la connexité du réseau"));
+        inner.add(creerBoutonOutil("Vérifier la connexité (BFS)", this::lancerBFS));
         inner.add(vgap(6));
-        inner.add(boutonEnAttente("Stations PMR accessibles",
-                "Filtre PMR : parcours limité aux stations accessibles"));
+        inner.add(creerBoutonOutil("Stations PMR accessibles", this::lancerPMR));
 
         // Wrap inner in a scroll pane that is transparent
         JScrollPane scroll = new JScrollPane(inner);
@@ -720,9 +737,18 @@ public class AppWindow extends JFrame {
         // Heure du spinner en "HH:MM:SS"
         java.util.Calendar cal = java.util.Calendar.getInstance();
         cal.setTime((java.util.Date) timeSpinner.getValue());
-        String startTime = String.format("%02d:%02d:00",
-                cal.get(java.util.Calendar.HOUR_OF_DAY),
-                cal.get(java.util.Calendar.MINUTE));
+        int spinH = cal.get(java.util.Calendar.HOUR_OF_DAY);
+        int spinM = cal.get(java.util.Calendar.MINUTE);
+
+        final String startTime;
+        final String arrivalDeadline;
+        if (!isDepartTime) {
+            arrivalDeadline = String.format("%02d:%02d:00", spinH, spinM);
+            startTime = arrivalDeadline; // utilisé seulement pour le label en cas d'erreur
+        } else {
+            arrivalDeadline = null;
+            startTime = String.format("%02d:%02d:00", spinH, spinM);
+        }
 
         resultLabel.setText("<html><i>Calcul en cours…</i></html>");
 
@@ -732,11 +758,9 @@ public class AppWindow extends JFrame {
         SwingWorker<Object[], Void> worker = new SwingWorker<>() {
             @Override
             protected Object[] doInBackground() throws Exception {
-                Journey j = Calculation.findJourney(
-                        oLat, oLon, dLat, dLon,
-                        2000, 500,
-                        startTime, 60,
-                        120, 5, 180);
+                Journey j = (arrivalDeadline != null)
+                        ? findJourneyByArrival(oLat, oLon, dLat, dLon, arrivalDeadline)
+                        : Calculation.findJourney(oLat, oLon, dLat, dLon, 2000, 500, startTime, 60, 120, 5, 180);
                 List<double[]> route = buildFullRoute(j);
                 return new Object[]{j, route};
             }
@@ -746,7 +770,7 @@ public class AppWindow extends JFrame {
                     Object[] result = get(60, java.util.concurrent.TimeUnit.SECONDS);
                     Journey j = (Journey) result[0];
                     @SuppressWarnings("unchecked") List<double[]> route = (List<double[]>) result[1];
-                    afficherResultat(d, a, startTime, j, route);
+                    afficherResultat(d, a, startTime, j, route, arrivalDeadline);
                 } catch (java.util.concurrent.TimeoutException tex) {
                     resultLabel.setText("<html><span style='color:#EF4444'>Timeout : calcul trop long (base DB surchargée ?)</span></html>");
                 } catch (Exception ex) {
@@ -807,6 +831,13 @@ public class AppWindow extends JFrame {
         return route;
     }
 
+    private Journey findJourneyByArrival(double oLat, double oLon,
+                                          double dLat, double dLon,
+                                          String deadline) throws Exception {
+        return Calculation.findJourneyByArrival(
+                oLat, oLon, dLat, dLon, 2000, 500, deadline, 120, 5, 180);
+    }
+
     private static void addIfNew(List<double[]> list, double[] pt) {
         if (pt == null) return;
         if (!list.isEmpty()) {
@@ -816,7 +847,7 @@ public class AppWindow extends JFrame {
         list.add(pt);
     }
 
-    private void afficherResultat(String dep, String arr, String startTime, Journey j, List<double[]> route) {
+    private void afficherResultat(String dep, String arr, String startTime, Journey j, List<double[]> route, String arrivalDeadline) {
         mapPanel.clearRoute();
         if (j.destStopId == null) {
             resultLabel.setText("<html><b>" + esc(dep) + " → " + esc(arr) + "</b>"
@@ -827,9 +858,12 @@ public class AppWindow extends JFrame {
         if (!route.isEmpty()) mapPanel.setRoute(route);
 
         // ── Calcul durée et correspondances ───────────────────────
-        int startSec    = Calculation.toSeconds(startTime);
+        // Utiliser l'heure du premier leg (départ réel) plutôt que l'heure de recherche
+        String actualDep = (!j.destPath.isEmpty() && j.destPath.get(0).departTime != null)
+                ? j.destPath.get(0).departTime : startTime;
+        int startSec    = Calculation.toSeconds(actualDep);
         int arrSec      = Calculation.toSeconds(j.destTotalArrivalTime);
-        int durationMin = (arrSec - startSec) / 60;
+        int durationMin = Math.max(0, (arrSec - startSec) / 60);
         long transitLegs   = j.destPath.stream().filter(l -> !l.aPied).count();
         int correspondances = (int) Math.max(0, transitLegs - 1);
         String heureArr = j.destTotalArrivalTime != null ? j.destTotalArrivalTime.substring(0, 5) : "—";
@@ -840,8 +874,18 @@ public class AppWindow extends JFrame {
           .append("&nbsp;<span style='color:#6B7280;font-size:11px'>")
           .append(correspondances).append(" correspondance").append(correspondances > 1 ? "s" : "")
           .append("</span><br>");
+        if (arrivalDeadline != null) {
+            boolean tooLate = Calculation.toSeconds(j.destTotalArrivalTime) > Calculation.toSeconds(arrivalDeadline);
+            if (tooLate) {
+                sb.append("<span style='color:#EF4444;font-size:10px'>⚠ Arrive après ")
+                  .append(arrivalDeadline, 0, 5).append(" — partez plus tôt</span><br>");
+            } else {
+                sb.append("<span style='color:#10B981;font-size:10px'>✓ Arrive avant ")
+                  .append(arrivalDeadline, 0, 5).append("</span><br>");
+            }
+        }
         sb.append("<span style='color:#6B7280'>")
-          .append(startTime, 0, 5).append(" → ").append(heureArr).append("</span><br><br>");
+          .append(actualDep, 0, 5).append(" → ").append(heureArr).append("</span><br><br>");
 
         for (Leg leg : j.destPath) {
             if (leg.aPied) {
@@ -859,13 +903,90 @@ public class AppWindow extends JFrame {
               .append(j.finalWalkSeconds / 60).append(" min à pied</span>");
         }
         sb.append("</html>");
-        resultLabel.setText(sb.toString());
+
+        // ── Détail itinéraire complet ──────────────────────────────
+        StringBuilder det = new StringBuilder(
+            "<html><body style='font-family:Segoe UI,sans-serif;font-size:12px;margin:10px'>"
+            + "<h2>&#x1F687; " + esc(dep) + " → " + esc(arr) + "</h2>"
+            + "<p><b>" + durationMin + " min</b> &nbsp;|&nbsp; "
+            + correspondances + " correspondance" + (correspondances > 1 ? "s" : "")
+            + " &nbsp;|&nbsp; " + actualDep.substring(0, 5) + " → " + heureArr + "</p>");
+        if (arrivalDeadline != null) {
+            boolean tooLate = Calculation.toSeconds(j.destTotalArrivalTime) > Calculation.toSeconds(arrivalDeadline);
+            det.append("<p>").append(tooLate
+                ? "<span style='color:#EF4444'>⚠ Arrive après " + arrivalDeadline.substring(0, 5) + "</span>"
+                : "<span style='color:#10B981'>✓ Arrive avant " + arrivalDeadline.substring(0, 5) + "</span>")
+              .append("</p>");
+        }
+        det.append("<hr>");
+        int legNum = 1;
+        for (Leg leg : j.destPath) {
+            String fromName = stopIdToName.getOrDefault(leg.fromStop, leg.fromStop);
+            String toName   = stopIdToName.getOrDefault(leg.toStop,   leg.toStop);
+            if (leg.aPied) {
+                int walkMin = (Calculation.toSeconds(leg.arriveTime) - Calculation.toSeconds(leg.departTime)) / 60;
+                det.append("<p>&#x1F6B6; <b>Correspondance à pied</b> (~").append(walkMin).append(" min)<br>")
+                   .append("<span style='color:#6B7280'>").append(esc(fromName))
+                   .append(" → ").append(esc(toName)).append("</span></p>");
+            } else {
+                int legMin = (Calculation.toSeconds(leg.arriveTime) - Calculation.toSeconds(leg.departTime)) / 60;
+                det.append("<p><b>Segment ").append(legNum++).append("</b> &nbsp;&#x1F687;<br>")
+                   .append("Départ : <b>").append(leg.departTime, 0, 5).append("</b> — ")
+                   .append(esc(fromName)).append("<br>")
+                   .append("Arrivée : <b>").append(leg.arriveTime, 0, 5).append("</b> — ")
+                   .append(esc(toName)).append("<br>")
+                   .append("<span style='color:#6B7280'>Durée : ").append(legMin).append(" min")
+                   .append(leg.tripId != null ? " &nbsp;|&nbsp; Trip : " + esc(leg.tripId) : "")
+                   .append("</span></p>");
+            }
+        }
+        if (j.finalWalkSeconds > 60)
+            det.append("<p>&#x1F6B6; Marche finale : <b>").append(j.finalWalkSeconds / 60).append(" min</b></p>");
+        det.append("</body></html>");
+
+        setResultat(sb.toString(), det.toString());
 
         // Centrer la carte entre départ et arrivée
         mapPanel.focusStation(dep);
     }
 
     // ── Helpers visuels ───────────────────────────────────────────
+
+    // Affiche un résumé dans la carte + rend le bouton "Voir les détails" visible si detail != null.
+    private void setResultat(String summary, String detail) {
+        resultLabel.setText(summary);
+        detailHtml = detail;
+        detailBtn.setVisible(detail != null && !detail.isBlank());
+        detailBtn.getParent().revalidate();
+        detailBtn.getParent().repaint();
+    }
+
+    // Ouvre une boîte de dialogue scrollable avec le contenu HTML complet.
+    private void ouvrirDetail() {
+        if (detailHtml == null) return;
+        JDialog dlg = new JDialog(this, "Détails", false);
+        dlg.setSize(640, 560);
+        dlg.setLocationRelativeTo(this);
+        dlg.setLayout(new BorderLayout());
+
+        JEditorPane ep = new JEditorPane("text/html", detailHtml);
+        ep.setEditable(false);
+        ep.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        ep.setBackground(Color.WHITE);
+        ep.setMargin(new Insets(14, 18, 14, 18));
+
+        JScrollPane sp = new JScrollPane(ep);
+        sp.setBorder(null);
+        dlg.add(sp, BorderLayout.CENTER);
+
+        JButton close = new JButton("Fermer");
+        close.addActionListener(e -> dlg.dispose());
+        JPanel bot = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        bot.add(close);
+        dlg.add(bot, BorderLayout.SOUTH);
+
+        dlg.setVisible(true);
+    }
 
     private void styleToggleBtn(JButton b, boolean selected) {
         b.setUI(new javax.swing.plaf.basic.BasicButtonUI());
@@ -883,6 +1004,298 @@ public class AppWindow extends JFrame {
             b.setForeground(LABEL_GREY);
             b.setBorder(BorderFactory.createLineBorder(BORDER_CLR));
         }
+    }
+
+    private JButton creerBoutonOutil(String label, Runnable action) {
+        JButton b = new JButton(label);
+        b.setUI(new javax.swing.plaf.basic.BasicButtonUI());
+        b.setBackground(FIELD_BG);
+        b.setForeground(new Color(80, 80, 80));
+        b.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        b.setFocusPainted(false);
+        b.setOpaque(true);
+        b.setContentAreaFilled(true);
+        b.setBorder(BorderFactory.createLineBorder(BORDER_CLR));
+        b.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        b.setMaximumSize(new Dimension(Integer.MAX_VALUE, 34));
+        b.setAlignmentX(LEFT_ALIGNMENT);
+        b.addActionListener(e -> action.run());
+        return b;
+    }
+
+    // ── Kruskal ───────────────────────────────────────────────────
+
+    private void lancerKruskal() {
+        setResultat("<html><i>Kruskal en cours…</i></html>", null);
+        SwingWorker<String[], Void> w = new SwingWorker<>() {
+            @Override protected String[] doInBackground() throws Exception { return calculerKruskal(); }
+            @Override protected void done() {
+                try {
+                    String[] r = get(120, java.util.concurrent.TimeUnit.SECONDS);
+                    setResultat(r[0], r[1]);
+                } catch (java.util.concurrent.TimeoutException tex) {
+                    setResultat("<html><span style='color:#EF4444'>Timeout Kruskal.</span></html>", null);
+                } catch (Exception ex) {
+                    Throwable c = ex.getCause() != null ? ex.getCause() : ex;
+                    setResultat("<html><span style='color:#EF4444'>Erreur : " + esc(c.getMessage()) + "</span></html>", null);
+                }
+            }
+        };
+        w.execute();
+    }
+
+    private String[] calculerKruskal() throws Exception {
+        // Paires d'arrêts consécutifs dans les trips (LEAD évite la self-join lourde)
+        String sql =
+            "SELECT DISTINCT s1.stop_id AS fid, s1.stop_lat::float AS flat, s1.stop_lon::float AS flon, "
+            + "s2.stop_id AS tid, s2.stop_lat::float AS tlat, s2.stop_lon::float AS tlon "
+            + "FROM (SELECT trip_id, stop_id, "
+            + "      LEAD(stop_id) OVER (PARTITION BY trip_id ORDER BY stop_sequence) AS nxt "
+            + "      FROM stop_times) t "
+            + "JOIN stops s1 ON s1.stop_id = t.stop_id "
+            + "JOIN stops s2 ON s2.stop_id = t.nxt "
+            + "WHERE t.nxt IS NOT NULL AND s1.stop_lat IS NOT NULL AND s2.stop_lat IS NOT NULL";
+
+        Map<String, Integer> idx = new LinkedHashMap<>();
+        List<int[]>          edgeIdx = new ArrayList<>();
+        List<Double>         edgeW   = new ArrayList<>();
+
+        try (Connection conn = Database.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                String fid = rs.getString("fid"), tid = rs.getString("tid");
+                double flat = rs.getDouble("flat"), flon = rs.getDouble("flon");
+                double tlat = rs.getDouble("tlat"), tlon = rs.getDouble("tlon");
+                idx.putIfAbsent(fid, idx.size());
+                idx.putIfAbsent(tid, idx.size());
+                int fi = idx.get(fid), ti = idx.get(tid);
+                if (fi == ti) continue;
+                edgeIdx.add(new int[]{fi, ti});
+                edgeW.add(Calculation.haversine(flat, flon, tlat, tlon));
+            }
+        }
+
+        int n = idx.size();
+        if (n == 0) return new String[]{"<html>Aucune donnée disponible.</html>", null};
+
+        // Trier les arêtes par poids
+        Integer[] order = new Integer[edgeIdx.size()];
+        for (int i = 0; i < order.length; i++) order[i] = i;
+        Arrays.sort(order, Comparator.comparingDouble(edgeW::get));
+
+        // Union-Find
+        int[] parent = new int[n], rnk = new int[n];
+        for (int i = 0; i < n; i++) parent[i] = i;
+
+        int mstEdges = 0;
+        double totalDist = 0;
+        for (int i : order) {
+            int a = kFind(parent, edgeIdx.get(i)[0]);
+            int b = kFind(parent, edgeIdx.get(i)[1]);
+            if (a != b) {
+                kUnion(parent, rnk, a, b);
+                mstEdges++;
+                totalDist += edgeW.get(i);
+            }
+        }
+
+        // Taille de chaque composante
+        Map<Integer, Integer> compSize = new HashMap<>();
+        for (int i = 0; i < n; i++) compSize.merge(kFind(parent, i), 1, Integer::sum);
+        List<Integer> sizes = new ArrayList<>(compSize.values());
+        sizes.sort(Collections.reverseOrder());
+        int components = sizes.size();
+
+        String connexite = components == 1
+            ? "<span style='color:#10B981'>✓ Réseau connexe</span>"
+            : "<span style='color:#EF4444'>⚠ " + components + " composantes connexes</span>";
+
+        String summary = "<html>"
+            + "<b style='font-size:14px'>Arbre Couvrant Minimal (Kruskal)</b><br><br>"
+            + "Arrêts : <b>" + n + "</b><br>"
+            + "Arêtes ACM : <b>" + mstEdges + "</b><br>"
+            + "Distance totale : <b>" + String.format("%.1f", totalDist / 1000) + " km</b><br><br>"
+            + connexite + "</html>";
+
+        StringBuilder det = new StringBuilder("<html><body style='font-family:Segoe UI,sans-serif;font-size:12px;margin:10px'>"
+            + "<h2>Arbre Couvrant Minimal (Kruskal)</h2>"
+            + "<p><b>" + n + "</b> arrêts &nbsp;|&nbsp; <b>" + mstEdges + "</b> arêtes ACM"
+            + " &nbsp;|&nbsp; Distance totale : <b>" + String.format("%.2f", totalDist / 1000) + " km</b></p>"
+            + "<p>" + connexite + "</p><hr>"
+            + "<h3>Composantes connexes (" + components + ")</h3><table border='0' cellpadding='4'>"
+            + "<tr><th align='left'>Rang</th><th align='left'>Taille (arrêts)</th><th align='left'>% du réseau</th></tr>");
+        for (int i = 0; i < sizes.size(); i++) {
+            det.append("<tr><td>").append(i + 1).append("</td><td>").append(sizes.get(i))
+               .append("</td><td>").append(String.format("%.1f%%", 100.0 * sizes.get(i) / n))
+               .append("</td></tr>");
+        }
+        det.append("</table></body></html>");
+
+        return new String[]{summary, det.toString()};
+    }
+
+    private int kFind(int[] p, int x) {
+        if (p[x] != x) p[x] = kFind(p, p[x]);
+        return p[x];
+    }
+
+    private void kUnion(int[] p, int[] r, int a, int b) {
+        if (r[a] < r[b]) { int t = a; a = b; b = t; }
+        p[b] = a;
+        if (r[a] == r[b]) r[a]++;
+    }
+
+    // ── BFS connexité ─────────────────────────────────────────────
+
+    private void lancerBFS() {
+        setResultat("<html><i>BFS en cours…</i></html>", null);
+        SwingWorker<String[], Void> w = new SwingWorker<>() {
+            @Override protected String[] doInBackground() throws Exception { return calculerBFS(); }
+            @Override protected void done() {
+                try {
+                    String[] r = get(120, java.util.concurrent.TimeUnit.SECONDS);
+                    setResultat(r[0], r[1]);
+                } catch (java.util.concurrent.TimeoutException tex) {
+                    setResultat("<html><span style='color:#EF4444'>Timeout BFS.</span></html>", null);
+                } catch (Exception ex) {
+                    Throwable c = ex.getCause() != null ? ex.getCause() : ex;
+                    setResultat("<html><span style='color:#EF4444'>Erreur : " + esc(c.getMessage()) + "</span></html>", null);
+                }
+            }
+        };
+        w.execute();
+    }
+
+    private String[] calculerBFS() throws Exception {
+        String sql =
+            "SELECT DISTINCT t.stop_id AS fid, t.nxt AS tid "
+            + "FROM (SELECT trip_id, stop_id, "
+            + "      LEAD(stop_id) OVER (PARTITION BY trip_id ORDER BY stop_sequence) AS nxt "
+            + "      FROM stop_times) t "
+            + "WHERE t.nxt IS NOT NULL";
+
+        Map<String, Set<String>> adj = new HashMap<>();
+        try (Connection conn = Database.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                String a = rs.getString("fid"), b = rs.getString("tid");
+                adj.computeIfAbsent(a, k -> new HashSet<>()).add(b);
+                adj.computeIfAbsent(b, k -> new HashSet<>()).add(a);
+            }
+        }
+
+        int total = adj.size();
+        if (total == 0) return new String[]{"<html>Aucune donnée.</html>", null};
+
+        Set<String> visited = new HashSet<>();
+        List<Integer> composantes = new ArrayList<>();
+
+        for (String start : adj.keySet()) {
+            if (visited.contains(start)) continue;
+            Queue<String> queue = new ArrayDeque<>();
+            queue.add(start); visited.add(start);
+            int size = 0;
+            while (!queue.isEmpty()) {
+                size++;
+                for (String nb : adj.get(queue.poll()))
+                    if (visited.add(nb)) queue.add(nb);
+            }
+            composantes.add(size);
+        }
+
+        composantes.sort(Collections.reverseOrder());
+        int nbComp = composantes.size(), largest = composantes.get(0);
+
+        String connexite = nbComp == 1
+            ? "<span style='color:#10B981'>✓ Réseau entièrement connexe</span>"
+            : "<span style='color:#EF4444'>⚠ Réseau non connexe — " + nbComp + " composantes</span>";
+
+        String summary = "<html><b style='font-size:14px'>Vérification connexité (BFS)</b><br><br>"
+            + "Arrêts analysés : <b>" + total + "</b><br>"
+            + "Composantes connexes : <b>" + nbComp + "</b><br>"
+            + "Plus grande composante : <b>" + largest + " arrêts</b> ("
+            + String.format("%.1f", 100.0 * largest / total) + "%)<br><br>"
+            + connexite + "<br>"
+            + "<span style='color:#6B7280;font-size:10px'>";
+        StringBuilder sumSb = new StringBuilder(summary);
+        int show = Math.min(5, composantes.size());
+        for (int i = 0; i < show; i++)
+            sumSb.append("Comp. ").append(i+1).append(" : ").append(composantes.get(i)).append(" arrêts<br>");
+        sumSb.append("</span></html>");
+
+        // Détail : toutes les composantes
+        StringBuilder det = new StringBuilder("<html><body style='font-family:Segoe UI,sans-serif;font-size:12px;margin:10px'>"
+            + "<h2>Vérification connexité (BFS)</h2>"
+            + "<p><b>" + total + "</b> arrêts analysés &nbsp;|&nbsp; <b>" + nbComp + "</b> composantes connexes</p>"
+            + "<p>" + connexite + "</p><hr>"
+            + "<h3>Toutes les composantes</h3>"
+            + "<table border='0' cellpadding='4'>"
+            + "<tr><th align='left'>Rang</th><th align='left'>Arrêts</th><th align='left'>% réseau</th></tr>");
+        for (int i = 0; i < composantes.size(); i++)
+            det.append("<tr><td>").append(i+1).append("</td><td>").append(composantes.get(i))
+               .append("</td><td>").append(String.format("%.1f%%", 100.0 * composantes.get(i) / total))
+               .append("</td></tr>");
+        det.append("</table></body></html>");
+
+        return new String[]{sumSb.toString(), det.toString()};
+    }
+
+    // ── PMR accessibles ───────────────────────────────────────────
+
+    private void lancerPMR() {
+        setResultat("<html><i>Chargement PMR…</i></html>", null);
+        SwingWorker<String[], Void> w = new SwingWorker<>() {
+            @Override protected String[] doInBackground() throws Exception { return calculerPMR(); }
+            @Override protected void done() {
+                try {
+                    String[] r = get(60, java.util.concurrent.TimeUnit.SECONDS);
+                    setResultat(r[0], r[1]);
+                } catch (java.util.concurrent.TimeoutException tex) {
+                    setResultat("<html><span style='color:#EF4444'>Timeout PMR.</span></html>", null);
+                } catch (Exception ex) {
+                    Throwable c = ex.getCause() != null ? ex.getCause() : ex;
+                    setResultat("<html><span style='color:#EF4444'>Erreur : " + esc(c.getMessage()) + "</span></html>", null);
+                }
+            }
+        };
+        w.execute();
+    }
+
+    private String[] calculerPMR() throws Exception {
+        String sql = "SELECT stop_name FROM stops "
+                   + "WHERE wheelchair_boarding = 1 "
+                   + "  AND stop_lat IS NOT NULL AND stop_lon IS NOT NULL "
+                   + "ORDER BY stop_name";
+
+        List<String> noms = new ArrayList<>();
+        try (Connection conn = Database.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) noms.add(fixEncoding(rs.getString("stop_name")));
+        }
+
+        int total = noms.size();
+        if (total == 0) return new String[]{"<html>Aucune station PMR trouvée.</html>", null};
+
+        // Résumé : 7 premières stations
+        StringBuilder sum = new StringBuilder("<html><b style='font-size:14px'>Stations PMR accessibles</b><br><br>"
+            + "<b>" + total + "</b> stations accessibles PMR<br><br>"
+            + "<span style='color:#6B7280;font-size:10px'>");
+        int show = Math.min(7, noms.size());
+        for (int i = 0; i < show; i++) sum.append("&#x267F; ").append(esc(noms.get(i))).append("<br>");
+        if (total > show) sum.append("… et ").append(total - show).append(" autres");
+        sum.append("</span></html>");
+
+        // Détail : liste complète
+        StringBuilder det = new StringBuilder("<html><body style='font-family:Segoe UI,sans-serif;font-size:12px;margin:10px'>"
+            + "<h2>&#x267F; Stations PMR accessibles</h2>"
+            + "<p><b>" + total + "</b> stations accessibles aux personnes à mobilité réduite</p><hr><ul>");
+        for (String nom : noms) det.append("<li>").append(esc(nom)).append("</li>");
+        det.append("</ul></body></html>");
+
+        return new String[]{sum.toString(), det.toString()};
     }
 
     private JButton boutonEnAttente(String label, String tooltip) {

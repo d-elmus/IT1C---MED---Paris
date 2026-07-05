@@ -380,6 +380,243 @@ public class Calculation {
         return result;
     }
 
+    // ──────────────────────────────────────────────────────────────────────────
+    // REVERSE RAPTOR — Arrivée à
+    // ──────────────────────────────────────────────────────────────────────────
+
+    // Algorithme principal : trouve le trajet qui part le PLUS TARD de l'origine
+    // et arrive a la destination avant arrivalDeadline.
+    // Dual du forward RAPTOR : au lieu de propager des heures d'arrivee minimales
+    // vers l'avant, on propage des heures de depart maximales vers l'arriere.
+    public static Journey findJourneyByArrival(
+            double originLat, double originLon,
+            double destLat, double destLon,
+            double originRadius, double destRadius,
+            String arrivalDeadline,
+            int minTransferSeconds, int maxChangements,
+            int horizonMinutes) {
+
+        // latestReady[stop] = heure (en secondes) a laquelle on peut AU PLUS TARD
+        // etre pret a cet arret et encore atteindre la destination avant la deadline.
+        Map<String, Integer> latestReady = new HashMap<>();
+        // legsFrom[stop] = leg qui PART de cet arret (convention avant, pour reconstruire origin→dest).
+        Map<String, Leg> legsFrom = new HashMap<>();
+
+        try (Connection conn = Database.getConnection()) {
+            int deadlineSec = toSeconds(arrivalDeadline);
+            String horizonStart = fromSeconds(deadlineSec - horizonMinutes * 60);
+
+            // 1. Initialisation : arrets proches de la destination.
+            // On ajoute minTransferSeconds pour que la condition arrSec+minTransfer <= lr
+            // se simplifie en arrSec <= deadlineSec - walkSec (pas de minTransfer a la descente finale).
+            List<Stops> destStops = getNearbyStopsFromDB(conn, destLat, destLon, destRadius);
+            Set<String> marked = new HashSet<>();
+
+            for (Stops s : destStops) {
+                double sLat = Double.parseDouble(s.getStop_lat());
+                double sLon = Double.parseDouble(s.getStop_lon());
+                int walkSec = walkSeconds(destLat, destLon, sLat, sLon);
+                int lr = deadlineSec - walkSec + minTransferSeconds;
+                String sid = s.getStop_id();
+                if (!latestReady.containsKey(sid) || lr > latestReady.get(sid)) {
+                    latestReady.put(sid, lr);
+                    marked.add(sid);
+                }
+            }
+
+            // Correspondances a pied initiales (vers la destination).
+            marked.addAll(applyReverseTransfers(latestReady, legsFrom, marked,
+                    getTransfersByTo(conn, marked)));
+
+            Map<String, List<Stops_times>> tripCache = new HashMap<>();
+            Set<String> loadedTripIds = new HashSet<>();
+
+            // 2. Rondes RAPTOR inverses (chaque ronde = un changement supplementaire).
+            for (int round = 0; round <= maxChangements && !marked.isEmpty(); round++) {
+                loadTripsThrough(conn, marked, horizonStart, arrivalDeadline, tripCache, loadedTripIds);
+                Set<String> improved = runReverseRound(tripCache, latestReady, legsFrom,
+                        marked, minTransferSeconds);
+                improved.addAll(applyReverseTransfers(latestReady, legsFrom, improved,
+                        getTransfersByTo(conn, improved)));
+                marked = improved;
+            }
+
+            // 3. Meilleur arret d'origine : celui qui maximise (latestReady[o] - marche).
+            List<Stops> originStops = getNearbyStopsFromDB(conn, originLat, originLon, originRadius);
+            String bestOriginStop = null;
+            int bestDepSec = Integer.MIN_VALUE;
+
+            for (Stops s : originStops) {
+                String sid = s.getStop_id();
+                Integer lr = latestReady.get(sid);
+                if (lr == null) continue;
+                double sLat = Double.parseDouble(s.getStop_lat());
+                double sLon = Double.parseDouble(s.getStop_lon());
+                int walkSec = walkSeconds(originLat, originLon, sLat, sLon);
+                int depSec = lr - walkSec;
+                if (depSec > bestDepSec) {
+                    bestDepSec = depSec;
+                    bestOriginStop = sid;
+                }
+            }
+
+            if (bestOriginStop == null) {
+                return new Journey(new HashMap<>(), new HashMap<>(), null, null, null, 0, new ArrayList<>());
+            }
+
+            // 4. Reconstruction du chemin vers l'avant (origin → dest).
+            List<Leg> path = reconstructReversePath(bestOriginStop, legsFrom);
+
+            String destStop = path.isEmpty() ? bestOriginStop
+                    : path.get(path.size() - 1).toStop;
+            String destArrivalTime = path.isEmpty() ? arrivalDeadline
+                    : path.get(path.size() - 1).arriveTime;
+
+            int finalWalkSec = 0;
+            for (Stops s : destStops) {
+                if (s.getStop_id().equals(destStop)) {
+                    double sLat = Double.parseDouble(s.getStop_lat());
+                    double sLon = Double.parseDouble(s.getStop_lon());
+                    finalWalkSec = walkSeconds(destLat, destLon, sLat, sLon);
+                    break;
+                }
+            }
+
+            String destTotalTime = fromSeconds(toSeconds(destArrivalTime) + finalWalkSec);
+
+            Map<String, String> arrivalTimesStr = new HashMap<>();
+            for (Map.Entry<String, Integer> e : latestReady.entrySet()) {
+                arrivalTimesStr.put(e.getKey(), fromSeconds(e.getValue()));
+            }
+
+            return new Journey(arrivalTimesStr, new HashMap<>(), destStop,
+                    destArrivalTime, destTotalTime, finalWalkSec, path);
+
+        } catch (SQLException e) {
+            System.err.println("Erreur SQL (findJourneyByArrival) : " + e.getMessage());
+            return new Journey(new HashMap<>(), new HashMap<>(), null, null, null, 0, new ArrayList<>());
+        }
+    }
+
+    // Ronde RAPTOR inverse : on scanne chaque trip de la fin vers le debut.
+    // tStar = dernier arret de descente valide rencontre (strictement plus loin dans le trip).
+    // Etape 1 : si tStar existe, on peut monter ici → ameliore latestReady[stop].
+    // Etape 2 : si cet arret est marque et son heure d'arrivee est ok → nouveau tStar.
+    // L'ordre 1 puis 2 garantit que tStar pointe toujours sur un arret STRICTEMENT apres le boarding.
+    private static Set<String> runReverseRound(
+            Map<String, List<Stops_times>> tripCache,
+            Map<String, Integer> latestReady,
+            Map<String, Leg> legsFrom,
+            Set<String> markedStops,
+            int minTransferSeconds) {
+
+        Set<String> improved = new HashSet<>();
+
+        for (List<Stops_times> seq : tripCache.values()) {
+            String tStarStop = null;
+            int tStarArrSec = -1;
+
+            for (int i = seq.size() - 1; i >= 0; i--) {
+                Stops_times st = seq.get(i);
+                String stopId = st.getStop_id();
+                int depSec = toSeconds(st.getDeparture_time());
+                int arrSec = toSeconds(st.getArrival_time());
+                if (depSec < 0 || arrSec < 0) continue;
+
+                // Etape 1 : monter ici et descendre a tStar ?
+                if (tStarStop != null) {
+                    int cur = latestReady.getOrDefault(stopId, Integer.MIN_VALUE);
+                    if (depSec > cur) {
+                        latestReady.put(stopId, depSec);
+                        legsFrom.put(stopId, new Leg(stopId, tStarStop, false,
+                                st.getTrip_id(), fromSeconds(depSec), fromSeconds(tStarArrSec)));
+                        improved.add(stopId);
+                    }
+                }
+
+                // Etape 2 : cet arret est-il un bon point de descente ?
+                if (markedStops.contains(stopId)) {
+                    Integer lr = latestReady.get(stopId);
+                    if (lr != null && arrSec + minTransferSeconds <= lr) {
+                        tStarStop = stopId;
+                        tStarArrSec = arrSec;
+                    }
+                }
+            }
+        }
+
+        return improved;
+    }
+
+    // Correspondances a pied en sens inverse : si on doit etre a toStop avant toLr,
+    // on peut y arriver en marchant depuis fromStop => latestReady[fromStop] = toLr - cost.
+    private static Set<String> applyReverseTransfers(
+            Map<String, Integer> latestReady,
+            Map<String, Leg> legsFrom,
+            Set<String> improved,
+            Map<String, List<Transfers>> transfersByTo) {
+
+        Set<String> walked = new HashSet<>();
+        for (String toStop : improved) {
+            List<Transfers> list = transfersByTo.get(toStop);
+            if (list == null) continue;
+            Integer toLr = latestReady.get(toStop);
+            if (toLr == null) continue;
+            for (Transfers t : list) {
+                if ("3".equals(t.getTransfer_type())) continue;
+                String fromStop = t.getFrom_stop_id();
+                int cost = 0;
+                String mtt = t.getMin_transfer_time();
+                if (mtt != null && !mtt.isBlank()) {
+                    try { cost = Integer.parseInt(mtt.trim()); } catch (NumberFormatException ignored) {}
+                }
+                int newLr = toLr - cost;
+                int cur = latestReady.getOrDefault(fromStop, Integer.MIN_VALUE);
+                if (newLr > cur) {
+                    latestReady.put(fromStop, newLr);
+                    legsFrom.put(fromStop, new Leg(fromStop, toStop, true, null,
+                            fromSeconds(newLr), fromSeconds(toLr)));
+                    walked.add(fromStop);
+                }
+            }
+        }
+        return walked;
+    }
+
+    // Reconstruction du chemin vers l'avant (origin → dest) depuis legsFrom.
+    private static List<Leg> reconstructReversePath(String originStop, Map<String, Leg> legsFrom) {
+        List<Leg> path = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        String current = originStop;
+        while (legsFrom.containsKey(current) && seen.add(current)) {
+            Leg leg = legsFrom.get(current);
+            path.add(leg);
+            current = leg.toStop;
+        }
+        return path;
+    }
+
+    // Requete SQL : transferts indexes par arret d'arrivee (to_stop_id).
+    // Utilise par le reverse RAPTOR pour propager latestReady vers l'arriere.
+    public static Map<String, List<Transfers>> getTransfersByTo(Connection conn, Set<String> toStopIds) {
+        Map<String, List<Transfers>> result = new HashMap<>();
+        if (toStopIds.isEmpty()) return result;
+        String sql = "SELECT from_stop_id, to_stop_id, transfer_type, min_transfer_time "
+                   + "FROM transfers WHERE to_stop_id = ANY(?)";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setArray(1, conn.createArrayOf("text", toStopIds.toArray()));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String[] row = {rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4)};
+                    result.computeIfAbsent(row[1], k -> new ArrayList<>()).add(new Transfers(row));
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("Erreur SQL (getTransfersByTo) : " + e.getMessage());
+        }
+        return result;
+    }
+
     // Requete SQL : les correspondances au depart des arrets donnes, indexees par from_stop_id.
     // from_stop_id = ANY(?) : on ne charge que les transferts utiles. Utilise la connexion fournie.
     public static Map<String, List<Transfers>> getTransfers(Connection conn, Set<String> fromStopIds) {
