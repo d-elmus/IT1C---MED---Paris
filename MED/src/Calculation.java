@@ -47,17 +47,30 @@ public class Calculation {
     // SEULS nouveaux trips -> on ne re-telecharge jamais un trip deja vu (gros gain de volume).
     public static void loadTripsThrough(Connection conn, Set<String> stopIds, String fromTime, String toTime,
             Map<String, List<Stops_times>> tripCache, Set<String> loadedTripIds) {
+        loadTripsThrough(conn, stopIds, fromTime, toTime, tripCache, loadedTripIds, null);
+    }
+
+    // Variante avec filtre calendrier : si activeServiceIds != null, seuls les trips dont le
+    // service_id circule ce jour-la sont candidats. null = pas de filtre (comportement historique).
+    public static void loadTripsThrough(Connection conn, Set<String> stopIds, String fromTime, String toTime,
+            Map<String, List<Stops_times>> tripCache, Set<String> loadedTripIds, Set<String> activeServiceIds) {
         if (stopIds.isEmpty()) {
             return;
         }
         // (a) trip_id qui passent par un des arrets, avec un depart dans l'horizon [fromTime, toTime]
         Set<String> candidates = new HashSet<>();
-        try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT DISTINCT trip_id FROM stop_times "
-              + "WHERE stop_id = ANY(?) AND departure_time BETWEEN ? AND ?")) {
+        String sqlIds = "SELECT DISTINCT trip_id FROM stop_times "
+                      + "WHERE stop_id = ANY(?) AND departure_time BETWEEN ? AND ?";
+        if (activeServiceIds != null) {
+            sqlIds += " AND trip_id IN (SELECT trip_id FROM trips WHERE service_id = ANY(?))";
+        }
+        try (PreparedStatement ps = conn.prepareStatement(sqlIds)) {
             ps.setArray(1, conn.createArrayOf("text", stopIds.toArray()));
             ps.setString(2, fromTime);
             ps.setString(3, toTime);
+            if (activeServiceIds != null) {
+                ps.setArray(4, conn.createArrayOf("text", activeServiceIds.toArray()));
+            }
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     candidates.add(rs.getString(1));
@@ -126,6 +139,49 @@ public class Calculation {
         int m = (totalSeconds % 3600) / 60;
         int s = totalSeconds % 60;
         return String.format("%02d:%02d:%02d", h, m, s);
+    }
+
+    // Services (service_id) qui circulent a la date donnee, d'apres calendar (jour de semaine +
+    // plage de validite) et calendar_dates (exceptions : 1 = ajoute, 2 = supprime).
+    // Renvoie null si aucun service n'est actif (feed GTFS expire par exemple) : les appelants
+    // retombent alors sur le mode non filtre, avec un avertissement sur stderr.
+    public static Set<String> getActiveServiceIds(java.time.LocalDate date) {
+        String dayColumn = switch (date.getDayOfWeek()) {
+            case MONDAY    -> "monday";
+            case TUESDAY   -> "tuesday";
+            case WEDNESDAY -> "wednesday";
+            case THURSDAY  -> "thursday";
+            case FRIDAY    -> "friday";
+            case SATURDAY  -> "saturday";
+            case SUNDAY    -> "sunday";
+        };
+        // UNION puis EXCEPT (gauche a droite) : (calendar + ajouts) - suppressions.
+        String sql = "SELECT service_id FROM calendar WHERE " + dayColumn
+                   + " AND ? BETWEEN start_date AND end_date "
+                   + "UNION SELECT service_id FROM calendar_dates WHERE date = ? AND exception_type = 1 "
+                   + "EXCEPT SELECT service_id FROM calendar_dates WHERE date = ? AND exception_type = 2";
+        Set<String> ids = new HashSet<>();
+        try (Connection conn = Database.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            java.sql.Date d = java.sql.Date.valueOf(date);
+            ps.setDate(1, d);
+            ps.setDate(2, d);
+            ps.setDate(3, d);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    ids.add(rs.getString(1));
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("Erreur SQL (getActiveServiceIds) : " + e.getMessage());
+            return null;
+        }
+        if (ids.isEmpty()) {
+            System.err.println("Avertissement : aucun service actif le " + date
+                    + " dans calendar/calendar_dates (feed GTFS expire ?) - filtre calendrier desactive.");
+            return null;
+        }
+        return ids;
     }
 
     // Round 0 : depuis les arrets d'origine (chacun atteint a originArrivals[stop] = startTime + marche
@@ -271,6 +327,21 @@ public class Calculation {
             double destLat, double destLon, double originRadius, double destRadius,
             String startTime, int windowMinutes, int minTransferSeconds, int maxChangements,
             int horizonMinutes) {
+        // Comportement historique : pas de filtre calendrier, pas d'extension de rayon.
+        return findJourneyEx(originLat, originLon, destLat, destLon, originRadius, destRadius,
+                startTime, windowMinutes, minTransferSeconds, maxChangements, horizonMinutes,
+                null, originRadius, destRadius);
+    }
+
+    // Variante parametrable du meme algorithme (RAPTOR inchange) :
+    // - activeServiceIds : services circulant a la date choisie (null = pas de filtre) ;
+    // - maxOriginRadius / maxDestRadius : rayon maximal si aucun arret n'est trouve au rayon
+    //   de base (le rayon s'etend par paliers de x1.5 jusqu'au maximum).
+    public static Journey findJourneyEx(double originLat, double originLon,
+            double destLat, double destLon, double originRadius, double destRadius,
+            String startTime, int windowMinutes, int minTransferSeconds, int maxChangements,
+            int horizonMinutes, Set<String> activeServiceIds,
+            double maxOriginRadius, double maxDestRadius) {
 
         Map<String, String> arrivalTimes = new HashMap<>();
         Map<String, Leg> legs = new HashMap<>();
@@ -282,7 +353,7 @@ public class Calculation {
         try (Connection conn = Database.getConnection()) {
 
             // 1. Arrets d'origine, chacun atteint a startTime + marche (point -> arret)
-            List<Stops> originStops = getNearbyStopsFromDB(conn, originLat, originLon, originRadius);
+            List<Stops> originStops = getNearbyStopsExpanding(conn, originLat, originLon, originRadius, maxOriginRadius);
             int startSec = toSeconds(startTime);
             Map<String, String> originArrivals = new HashMap<>();
             for (Stops s : originStops) {
@@ -299,7 +370,7 @@ public class Calculation {
             String horizonEnd = fromSeconds(startSec + horizonMinutes * 60);
 
             // 2 + 3. Trips autour de l'origine, round 0, puis correspondances a pied
-            loadTripsThrough(conn, originArrivals.keySet(), startTime, horizonEnd, tripCache, loadedTripIds);
+            loadTripsThrough(conn, originArrivals.keySet(), startTime, horizonEnd, tripCache, loadedTripIds, activeServiceIds);
             arrivalTimes.putAll(getRound0ArrivalTimes(tripCache, originArrivals, startTime, windowMinutes, legs));
             Set<String> marked = new HashSet<>(arrivalTimes.keySet());
             marked.addAll(applyTransfers(arrivalTimes, legs, marked, getTransfers(conn, marked)));
@@ -307,14 +378,14 @@ public class Calculation {
             // 4. Rondes suivantes : chaque ronde ajoute une correspondance (un trip de plus).
             //    Arret anticipe : la boucle s'arrete des qu'une ronde n'ameliore plus rien (marked vide).
             for (int round = 1; round <= maxChangements && !marked.isEmpty(); round++) {
-                loadTripsThrough(conn, marked, startTime, horizonEnd, tripCache, loadedTripIds);   // seulement les NOUVEAUX trips, dans l'horizon
+                loadTripsThrough(conn, marked, startTime, horizonEnd, tripCache, loadedTripIds, activeServiceIds);   // seulement les NOUVEAUX trips, dans l'horizon
                 Set<String> improved = runRound(tripCache, arrivalTimes, legs, marked, minTransferSeconds);
                 improved.addAll(applyTransfers(arrivalTimes, legs, improved, getTransfers(conn, improved)));
                 marked = improved;
             }
 
             // 5. Destination : arret proche minimisant le TEMPS TOTAL (transit + marche finale).
-            List<Stops> destStops = getNearbyStopsFromDB(conn, destLat, destLon, destRadius);
+            List<Stops> destStops = getNearbyStopsExpanding(conn, destLat, destLon, destRadius, maxDestRadius);
             for (Stops s : destStops) {
                 String arr = arrivalTimes.get(s.getStop_id());
                 if (arr == null) {
@@ -380,6 +451,22 @@ public class Calculation {
         return result;
     }
 
+    // Recherche d'arrets avec extension automatique du rayon : si aucun arret n'est trouve
+    // au rayon de base (ex. point au milieu d'un parc), le rayon augmente par paliers de x1.5
+    // jusqu'a maxRadiusMeters. Resout le cas "aucun metro detecte" sans toucher a l'algorithme.
+    public static List<Stops> getNearbyStopsExpanding(Connection conn, double lat, double lon,
+            double radiusMeters, double maxRadiusMeters) {
+        List<Stops> result = getNearbyStopsFromDB(conn, lat, lon, radiusMeters);
+        double r = radiusMeters;
+        while (result.isEmpty() && r < maxRadiusMeters) {
+            r = Math.min(r * 1.5, maxRadiusMeters);
+            System.err.println(String.format(
+                    "Aucun arret dans le rayon demande : extension a %.0f m", r));
+            result = getNearbyStopsFromDB(conn, lat, lon, r);
+        }
+        return result;
+    }
+
     // ──────────────────────────────────────────────────────────────────────────
     // REVERSE RAPTOR — Arrivée à
     // ──────────────────────────────────────────────────────────────────────────
@@ -395,6 +482,22 @@ public class Calculation {
             String arrivalDeadline,
             int minTransferSeconds, int maxChangements,
             int horizonMinutes) {
+        // Comportement historique : pas de filtre calendrier, pas d'extension de rayon.
+        return findJourneyByArrivalEx(originLat, originLon, destLat, destLon,
+                originRadius, destRadius, arrivalDeadline, minTransferSeconds, maxChangements,
+                horizonMinutes, null, originRadius, destRadius);
+    }
+
+    // Variante parametrable du reverse RAPTOR (algorithme inchange) : filtre calendrier
+    // optionnel + extension automatique du rayon, comme findJourneyEx.
+    public static Journey findJourneyByArrivalEx(
+            double originLat, double originLon,
+            double destLat, double destLon,
+            double originRadius, double destRadius,
+            String arrivalDeadline,
+            int minTransferSeconds, int maxChangements,
+            int horizonMinutes, Set<String> activeServiceIds,
+            double maxOriginRadius, double maxDestRadius) {
 
         // latestReady[stop] = heure (en secondes) a laquelle on peut AU PLUS TARD
         // etre pret a cet arret et encore atteindre la destination avant la deadline.
@@ -409,7 +512,7 @@ public class Calculation {
             // 1. Initialisation : arrets proches de la destination.
             // On ajoute minTransferSeconds pour que la condition arrSec+minTransfer <= lr
             // se simplifie en arrSec <= deadlineSec - walkSec (pas de minTransfer a la descente finale).
-            List<Stops> destStops = getNearbyStopsFromDB(conn, destLat, destLon, destRadius);
+            List<Stops> destStops = getNearbyStopsExpanding(conn, destLat, destLon, destRadius, maxDestRadius);
             Set<String> marked = new HashSet<>();
 
             for (Stops s : destStops) {
@@ -433,7 +536,7 @@ public class Calculation {
 
             // 2. Rondes RAPTOR inverses (chaque ronde = un changement supplementaire).
             for (int round = 0; round <= maxChangements && !marked.isEmpty(); round++) {
-                loadTripsThrough(conn, marked, horizonStart, arrivalDeadline, tripCache, loadedTripIds);
+                loadTripsThrough(conn, marked, horizonStart, arrivalDeadline, tripCache, loadedTripIds, activeServiceIds);
                 Set<String> improved = runReverseRound(tripCache, latestReady, legsFrom,
                         marked, minTransferSeconds);
                 improved.addAll(applyReverseTransfers(latestReady, legsFrom, improved,
@@ -442,7 +545,7 @@ public class Calculation {
             }
 
             // 3. Meilleur arret d'origine : celui qui maximise (latestReady[o] - marche).
-            List<Stops> originStops = getNearbyStopsFromDB(conn, originLat, originLon, originRadius);
+            List<Stops> originStops = getNearbyStopsExpanding(conn, originLat, originLon, originRadius, maxOriginRadius);
             String bestOriginStop = null;
             int bestDepSec = Integer.MIN_VALUE;
 

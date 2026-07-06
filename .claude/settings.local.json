@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(java -cp /private/tmp/claude-501/-Users-mathieu-GithubMastercamp-IT1C---MED---Paris/c50822a5-a555-4aec-b021-09beb8d8eef4/scratchpad/classes:MED/lib/postgresql.jar main)"
+    ]
+  }
+}

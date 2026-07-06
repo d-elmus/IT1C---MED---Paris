@@ -15,11 +15,18 @@ public class MetroLoader {
         public final String name;
         public final double lat;
         public final double lon;
+        // Station accessible aux personnes a mobilite reduite (au moins un quai accessible).
+        public final boolean wheelchair;
 
         public StationInfo(String name, double lat, double lon) {
+            this(name, lat, lon, false);
+        }
+
+        public StationInfo(String name, double lat, double lon, boolean wheelchair) {
             this.name = name;
             this.lat  = lat;
             this.lon  = lon;
+            this.wheelchair = wheelchair;
         }
     }
 
