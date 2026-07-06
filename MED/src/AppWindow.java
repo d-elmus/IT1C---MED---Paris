@@ -919,7 +919,26 @@ public class AppWindow extends JFrame {
               .append("</p>");
         }
         det.append("<hr>");
-        int legNum = 1;
+
+        // Résoudre les noms de lignes via trip_id → route_name
+        Map<String, String> tripToRoute = new HashMap<>();
+        List<String> transitTripIds = new ArrayList<>();
+        for (Leg leg : j.destPath)
+            if (!leg.aPied && leg.tripId != null) transitTripIds.add(leg.tripId);
+        if (!transitTripIds.isEmpty()) {
+            String placeholders = String.join(",", java.util.Collections.nCopies(transitTripIds.size(), "?"));
+            String routeSql = "SELECT t.trip_id, COALESCE(NULLIF(r.route_short_name,''), r.route_long_name) AS rname "
+                + "FROM trips t JOIN routes r ON r.route_id = t.route_id "
+                + "WHERE t.trip_id IN (" + placeholders + ")";
+            try (Connection rconn = Database.getConnection();
+                 PreparedStatement ps = rconn.prepareStatement(routeSql)) {
+                for (int i = 0; i < transitTripIds.size(); i++) ps.setString(i + 1, transitTripIds.get(i));
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) tripToRoute.put(rs.getString("trip_id"), rs.getString("rname"));
+                }
+            } catch (Exception ignored) {}
+        }
+
         for (Leg leg : j.destPath) {
             String fromName = stopIdToName.getOrDefault(leg.fromStop, leg.fromStop);
             String toName   = stopIdToName.getOrDefault(leg.toStop,   leg.toStop);
@@ -930,14 +949,14 @@ public class AppWindow extends JFrame {
                    .append(" → ").append(esc(toName)).append("</span></p>");
             } else {
                 int legMin = (Calculation.toSeconds(leg.arriveTime) - Calculation.toSeconds(leg.departTime)) / 60;
-                det.append("<p><b>Segment ").append(legNum++).append("</b> &nbsp;&#x1F687;<br>")
+                String routeName = leg.tripId != null
+                    ? tripToRoute.getOrDefault(leg.tripId, "Ligne inconnue") : "Ligne inconnue";
+                det.append("<p><b>").append(esc(routeName)).append("</b> &nbsp;&#x1F687;<br>")
                    .append("Départ : <b>").append(leg.departTime, 0, 5).append("</b> — ")
                    .append(esc(fromName)).append("<br>")
                    .append("Arrivée : <b>").append(leg.arriveTime, 0, 5).append("</b> — ")
                    .append(esc(toName)).append("<br>")
-                   .append("<span style='color:#6B7280'>Durée : ").append(legMin).append(" min")
-                   .append(leg.tripId != null ? " &nbsp;|&nbsp; Trip : " + esc(leg.tripId) : "")
-                   .append("</span></p>");
+                   .append("<span style='color:#6B7280'>Durée : ").append(legMin).append(" min</span></p>");
             }
         }
         if (j.finalWalkSeconds > 60)
@@ -1168,21 +1187,27 @@ public class AppWindow extends JFrame {
     }
 
     private String[] calculerBFS() throws Exception {
-        String sql =
+        // Edges from consecutive stops in same trip
+        String sqlTrips =
             "SELECT DISTINCT t.stop_id AS fid, t.nxt AS tid "
             + "FROM (SELECT trip_id, stop_id, "
             + "      LEAD(stop_id) OVER (PARTITION BY trip_id ORDER BY stop_sequence) AS nxt "
             + "      FROM stop_times) t "
             + "WHERE t.nxt IS NOT NULL";
+        // Edges from transfers table (same-station connections, e.g. Paris Nord platforms)
+        String sqlTransfers = "SELECT from_stop_id AS fid, to_stop_id AS tid FROM transfers";
 
         Map<String, Set<String>> adj = new HashMap<>();
-        try (Connection conn = Database.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql);
-             ResultSet rs = ps.executeQuery()) {
-            while (rs.next()) {
-                String a = rs.getString("fid"), b = rs.getString("tid");
-                adj.computeIfAbsent(a, k -> new HashSet<>()).add(b);
-                adj.computeIfAbsent(b, k -> new HashSet<>()).add(a);
+        try (Connection conn = Database.getConnection()) {
+            for (String sql : new String[]{sqlTrips, sqlTransfers}) {
+                try (PreparedStatement ps = conn.prepareStatement(sql);
+                     ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        String a = rs.getString("fid"), b = rs.getString("tid");
+                        adj.computeIfAbsent(a, k -> new HashSet<>()).add(b);
+                        adj.computeIfAbsent(b, k -> new HashSet<>()).add(a);
+                    }
+                }
             }
         }
 
