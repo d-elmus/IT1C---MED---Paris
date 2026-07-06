@@ -73,14 +73,17 @@ public class AppWindow extends JFrame {
         final Journey journey;
         final List<MapPanel.RouteSeg> segs;
         final Map<String, String[]> tripInfo;
+        final int initialWalkSec;   // marche du point de départ au premier arrêt
 
         Alternative(String label, String tooltip, Journey journey,
-                List<MapPanel.RouteSeg> segs, Map<String, String[]> tripInfo) {
+                List<MapPanel.RouteSeg> segs, Map<String, String[]> tripInfo,
+                int initialWalkSec) {
             this.label    = label;
             this.tooltip  = tooltip;
             this.journey  = journey;
             this.segs     = segs;
             this.tripInfo = tripInfo;
+            this.initialWalkSec = initialWalkSec;
         }
     }
 
@@ -1113,7 +1116,8 @@ public class AppWindow extends JFrame {
                         ? computeAlternatives(j, o, t, rayonArrivee, maxRayonArrivee,
                                 startTime, segs, tripInfo)
                         : new ArrayList<>();
-                return new Object[]{j, segs, tripInfo, calendarState, o, t, alts};
+                int initialWalkSec = computeInitialWalkSec(j, o);
+                return new Object[]{j, segs, tripInfo, calendarState, o, t, alts, initialWalkSec};
             }
             @Override
             protected void done() {
@@ -1141,7 +1145,7 @@ public class AppWindow extends JFrame {
                         montrerAlternative(0);
                     } else {
                         afficherResultat(d, a, startTime, j, segs, tripInfo, arrivalDeadline,
-                                (Boolean) result[3], travelDate);
+                                (Boolean) result[3], travelDate, (Integer) result[7]);
                     }
                 } catch (java.util.concurrent.TimeoutException tex) {
                     resultLabel.setText("<html><span style='color:#EF4444'>Timeout : calcul trop long (base DB surchargée ?)</span></html>");
@@ -1494,7 +1498,7 @@ public class AppWindow extends JFrame {
         class Cand {
             String stopId, arrival;
             List<Leg> path;
-            int totalSec, transfers, walkSec, finalWalkSec;
+            int totalSec, transfers, walkSec, finalWalkSec, initialWalkSec;
             boolean pmr;
         }
         List<Cand> cands = new ArrayList<>();
@@ -1553,7 +1557,10 @@ public class AppWindow extends JFrame {
                 int walk = c.finalWalkSec;
                 if (!path.isEmpty()) {
                     double[] fc = coords.get(path.get(0).fromStop);
-                    if (fc != null) walk += Calculation.walkSeconds(o[0], o[1], fc[0], fc[1]);
+                    if (fc != null) {
+                        c.initialWalkSec = Calculation.walkSeconds(o[0], o[1], fc[0], fc[1]);
+                        walk += c.initialWalkSec;
+                    }
                     for (Leg l : path) {
                         if (l.aPied) walk += Math.max(0,
                                 Calculation.toSeconds(l.arriveTime) - Calculation.toSeconds(l.departTime));
@@ -1620,7 +1627,8 @@ public class AppWindow extends JFrame {
                     + " · " + (c.walkSec / 60) + " min de marche"
                     + " · durée " + Math.max(0, (c.totalSec - startSec) / 60) + " min"
                     + (c.pmr ? " · accessible PMR" : "");
-            out.add(new Alternative(String.join(" / ", e.getValue()), tooltip, alt, segs, info));
+            out.add(new Alternative(String.join(" / ", e.getValue()), tooltip, alt, segs, info,
+                    c.initialWalkSec));
         }
         return out;
     }
@@ -1654,7 +1662,28 @@ public class AppWindow extends JFrame {
         }
         Alternative alt = currentAlts.get(idx);
         afficherResultat(ctxDep, ctxArr, ctxStart, alt.journey, alt.segs, alt.tripInfo,
-                ctxDeadline, ctxCal, ctxDate);
+                ctxDeadline, ctxCal, ctxDate, alt.initialWalkSec);
+    }
+
+    // Temps de marche du point de départ au premier arrêt d'embarquement du trajet.
+    private int computeInitialWalkSec(Journey j, double[] originPt) {
+        if (j == null || j.destPath == null || j.destPath.isEmpty() || originPt == null) return 0;
+        String sid = j.destPath.get(0).fromStop;
+        if (sid == null) return 0;
+        String sql = "SELECT stop_lat::float, stop_lon::float FROM stops WHERE stop_id = ?";
+        try (Connection conn = Database.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, sid);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return Calculation.walkSeconds(originPt[0], originPt[1],
+                            rs.getDouble(1), rs.getDouble(2));
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("[INITIAL WALK ERROR] " + e.getMessage());
+        }
+        return 0;
     }
 
     private static void addIfNew(List<double[]> list, double[] pt) {
@@ -1668,7 +1697,8 @@ public class AppWindow extends JFrame {
 
     private void afficherResultat(String dep, String arr, String startTime, Journey j,
             List<MapPanel.RouteSeg> segs, Map<String, String[]> tripInfo,
-            String arrivalDeadline, Boolean calendarState, java.time.LocalDate travelDate) {
+            String arrivalDeadline, Boolean calendarState, java.time.LocalDate travelDate,
+            int initialWalkSec) {
         mapPanel.clearRoute();
         if (j.destStopId == null) {
             resultLabel.setText("<html><b>" + esc(dep) + " → " + esc(arr) + "</b>"
@@ -1682,7 +1712,8 @@ public class AppWindow extends JFrame {
         // Utiliser l'heure du premier leg (départ réel) plutôt que l'heure de recherche
         String actualDep = (!j.destPath.isEmpty() && j.destPath.get(0).departTime != null)
                 ? j.destPath.get(0).departTime : startTime;
-        int startSec    = Calculation.toSeconds(actualDep);
+        // Durée porte à porte : la marche initiale précède le départ du premier véhicule.
+        int startSec    = Calculation.toSeconds(actualDep) - Math.max(0, initialWalkSec);
         int arrSec      = Calculation.toSeconds(j.destTotalArrivalTime);
         int durationMin = Math.max(0, (arrSec - startSec) / 60);
         long transitLegs   = j.destPath.stream().filter(l -> !l.aPied).count();
@@ -1718,6 +1749,12 @@ public class AppWindow extends JFrame {
         }
         sb.append("<span style='color:#6B7280'>")
           .append(actualDep, 0, 5).append(" → ").append(heureArr).append("</span><br><br>");
+
+        // Marche initiale : point de départ -> premier arrêt d'embarquement
+        if (initialWalkSec > 60) {
+            sb.append("<span style='color:#9CA3AF'>&#x1F6B6; ").append(initialWalkSec / 60)
+              .append(" min à pied jusqu'au premier arrêt</span><br>");
+        }
 
         for (Leg leg : j.destPath) {
             if (leg.aPied) {
@@ -1764,6 +1801,14 @@ public class AppWindow extends JFrame {
                   + " dans les données GTFS — horaires non filtrés</span></p>");
         }
         det.append("<hr>");
+
+        if (initialWalkSec > 60 && !j.destPath.isEmpty()) {
+            String firstName = stopIdToName.getOrDefault(j.destPath.get(0).fromStop,
+                    j.destPath.get(0).fromStop);
+            det.append("<p>&#x1F6B6; <b>Marche initiale</b> (~").append(initialWalkSec / 60)
+               .append(" min)<br><span style='color:#6B7280'>Du point de départ à ")
+               .append(esc(firstName)).append("</span></p>");
+        }
 
         for (Leg leg : j.destPath) {
             String fromName = stopIdToName.getOrDefault(leg.fromStop, leg.fromStop);
