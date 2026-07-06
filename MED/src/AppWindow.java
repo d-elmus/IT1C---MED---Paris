@@ -24,6 +24,10 @@ public class AppWindow extends JFrame {
     private final JButton detailBtn  = new JButton("Voir les détails →");
     private String        detailHtml = null;
 
+    // Bouton principal de recherche (désactivé pendant le calcul, anti double-clic)
+    private JButton searchBtn;
+    private static final String SEARCH_LABEL = "Rechercher un itinéraire  →";
+
     // Station name → coordonnées (pour appel RAPTOR)
     private final Map<String, MetroLoader.StationInfo> stationMap  = new HashMap<>();
     // stop_id → [lat, lon] (pour tracer l'itinéraire sur la carte)
@@ -501,7 +505,9 @@ public class AppWindow extends JFrame {
         inner.add(buildStationField(departBox, GREEN_DOT, true));
         inner.add(vgap(6));
         inner.add(buildStationField(arriveeBox, BLUE_DOT, false));
-        inner.add(vgap(14));
+        inner.add(vgap(4));
+        inner.add(buildSwapRow());
+        inner.add(vgap(10));
 
         inner.add(buildTimeRow());
         inner.add(vgap(6));
@@ -806,6 +812,46 @@ public class AppWindow extends JFrame {
         return field;
     }
 
+    // Petit lien "Inverser" sous les deux champs : echange depart et arrivee
+    // (textes, points personnalises et marqueurs).
+    private JPanel buildSwapRow() {
+        JPanel row = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+        row.setOpaque(false);
+        row.setAlignmentX(LEFT_ALIGNMENT);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 18));
+
+        JButton swap = new JButton("Inverser départ / arrivée");
+        swap.setUI(new javax.swing.plaf.basic.BasicButtonUI());
+        swap.setFont(new Font("Segoe UI", Font.BOLD, 10));
+        swap.setForeground(BLUE_DARK);
+        swap.setOpaque(false);
+        swap.setContentAreaFilled(false);
+        swap.setBorderPainted(false);
+        swap.setFocusPainted(false);
+        swap.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        swap.addActionListener(e -> inverserDepartArrivee());
+        row.add(swap);
+        return row;
+    }
+
+    private void inverserDepartArrivee() {
+        suppressAuto = true;
+        try {
+            double[] oldDep = customDepart;
+            double[] oldArr = customArrivee;
+            Object dSel = departBox.getSelectedItem();
+            Object aSel = arriveeBox.getSelectedItem();
+            departBox.setSelectedItem(aSel == null ? "" : aSel.toString());
+            arriveeBox.setSelectedItem(dSel == null ? "" : dSel.toString());
+            // Apres les setSelectedItem (les listeners peuvent remettre les points a null)
+            customDepart  = oldArr;
+            customArrivee = oldDep;
+            mapPanel.setPointMarkers(customDepart, customArrivee);
+        } finally {
+            suppressAuto = false;
+        }
+    }
+
     // Ligne "Date du trajet" : la date sert au filtre calendrier (services actifs ce jour-la).
     private JPanel buildDateRow() {
         JPanel row = new JPanel(new GridLayout(1, 2, 6, 0));
@@ -913,7 +959,7 @@ public class AppWindow extends JFrame {
     }
 
     private JButton buildSearchButton() {
-        JButton btn = new JButton("Rechercher un itinéraire  →") {
+        JButton btn = new JButton(SEARCH_LABEL) {
             @Override
             protected void paintComponent(Graphics g) {
                 Graphics2D g2 = (Graphics2D) g.create();
@@ -946,6 +992,7 @@ public class AppWindow extends JFrame {
             @Override public void mouseExited(MouseEvent e)  { btn.setBackground(BLUE); btn.repaint(); }
         });
         btn.addActionListener(e -> rechercher());
+        searchBtn = btn;
         return btn;
     }
 
@@ -1030,6 +1077,11 @@ public class AppWindow extends JFrame {
         final double[] customA = customArrivee;
 
         resultLabel.setText("<html><i>Calcul en cours…</i></html>");
+        // Bouton désactivé le temps du calcul (évite les recherches en double)
+        searchBtn.setEnabled(false);
+        searchBtn.setText("Recherche en cours…");
+        searchBtn.setBackground(new Color(147, 197, 253));
+        searchBtn.repaint();
 
         SwingWorker<Object[], Void> worker = new SwingWorker<>() {
             @Override
@@ -1098,6 +1150,11 @@ public class AppWindow extends JFrame {
                     String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
                     System.err.println("[RAPTOR ERROR] " + msg);
                     resultLabel.setText("<html><span style='color:#EF4444'>Erreur : " + esc(msg) + "</span></html>");
+                } finally {
+                    searchBtn.setEnabled(true);
+                    searchBtn.setText(SEARCH_LABEL);
+                    searchBtn.setBackground(BLUE);
+                    searchBtn.repaint();
                 }
             }
         };

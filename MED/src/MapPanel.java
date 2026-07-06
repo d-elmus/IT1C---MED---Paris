@@ -391,7 +391,52 @@ public class MapPanel extends JPanel {
         g2.setColor(new Color(50, 50, 50));
         g2.drawString(zoomStr, 14, h - 9);
 
+        paintLegend(g2, w, h);
+
         g2.dispose();
+    }
+
+    // Légende en bas à droite, au-dessus de l'attribution OpenStreetMap.
+    private void paintLegend(Graphics2D g2, int w, int h) {
+        int lw = 176, lh = 78;
+        int lx = w - lw - 8, ly = h - 18 - 6 - lh;
+        g2.setColor(new Color(255, 255, 255, 225));
+        g2.fillRoundRect(lx, ly, lw, lh, 8, 8);
+        g2.setColor(new Color(210, 210, 210));
+        g2.drawRoundRect(lx, ly, lw, lh, 8, 8);
+
+        g2.setFont(new Font("Segoe UI", Font.PLAIN, 10));
+        int tx = lx + 28, ty = ly + 16, step = 17;
+        g2.setColor(new Color(60, 60, 60));
+
+        // Station classique (rond rouge)
+        g2.setColor(Color.WHITE);              g2.fillOval(lx + 10, ty - 8, 11, 11);
+        g2.setColor(new Color(227, 5, 28));    g2.fillOval(lx + 11, ty - 7, 9, 9);
+        g2.setColor(new Color(60, 60, 60));    g2.drawString("Station", tx, ty);
+        ty += step;
+
+        // Station accessible PMR (rond bleu)
+        g2.setColor(Color.WHITE);              g2.fillOval(lx + 10, ty - 8, 11, 11);
+        g2.setColor(PMR_BLUE);                 g2.fillOval(lx + 11, ty - 7, 9, 9);
+        g2.setColor(new Color(60, 60, 60));    g2.drawString("Station accessible PMR", tx, ty);
+        ty += step;
+
+        // Trajet en véhicule (trait plein, couleur de ligne)
+        g2.setColor(new Color(37, 99, 235));
+        g2.setStroke(new BasicStroke(3.5f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+        g2.drawLine(lx + 8, ty - 4, lx + 24, ty - 4);
+        g2.setColor(new Color(60, 60, 60));
+        g2.drawString("Trajet (couleur de ligne)", tx, ty);
+        ty += step;
+
+        // Marche à pied (pointillés gris)
+        g2.setColor(new Color(75, 85, 99));
+        g2.setStroke(new BasicStroke(2.5f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND,
+                10f, new float[]{4f, 5f}, 0f));
+        g2.drawLine(lx + 8, ty - 4, lx + 24, ty - 4);
+        g2.setColor(new Color(60, 60, 60));
+        g2.drawString("Marche à pied", tx, ty);
+        g2.setStroke(new BasicStroke(1f));
     }
 
     // Trace les segments : contour blanc + couleur de ligne, pointilles pour la marche.
