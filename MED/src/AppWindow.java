@@ -1923,12 +1923,21 @@ public class AppWindow extends JFrame {
 
     private void lancerKruskal() {
         setResultat("<html><i>Kruskal en cours…</i></html>", null);
-        SwingWorker<String[], Void> w = new SwingWorker<>() {
-            @Override protected String[] doInBackground() throws Exception { return calculerKruskal(); }
+        SwingWorker<Object[], Void> w = new SwingWorker<>() {
+            @Override protected Object[] doInBackground() throws Exception { return calculerKruskal(); }
             @Override protected void done() {
                 try {
-                    String[] r = get(120, java.util.concurrent.TimeUnit.SECONDS);
-                    setResultat(r[0], r[1]);
+                    Object[] r = get(120, java.util.concurrent.TimeUnit.SECONDS);
+                    setResultat((String) r[0], (String) r[1]);
+                    // Dessin de l'arborescence sur la carte, couleurs officielles des lignes
+                    @SuppressWarnings("unchecked")
+                    List<MapPanel.RouteSeg> segs = (List<MapPanel.RouteSeg>) r[2];
+                    if (segs != null && !segs.isEmpty()) {
+                        mapPanel.setRouteSegments(segs);
+                        List<double[]> pts = new ArrayList<>();
+                        for (MapPanel.RouteSeg s : segs) pts.addAll(s.points);
+                        mapPanel.fitBounds(pts);
+                    }
                 } catch (java.util.concurrent.TimeoutException tex) {
                     setResultat("<html><span style='color:#EF4444'>Timeout Kruskal.</span></html>", null);
                 } catch (Exception ex) {
@@ -1940,21 +1949,34 @@ public class AppWindow extends JFrame {
         w.execute();
     }
 
-    private String[] calculerKruskal() throws Exception {
-        // Paires d'arrêts consécutifs dans les trips (LEAD évite la self-join lourde)
+    // Renvoie {résumé HTML, détail HTML, segments de l'ACM à dessiner sur la carte}.
+    private Object[] calculerKruskal() throws Exception {
+        // Paires d'arrêts consécutifs dans les trips (LEAD évite la self-join lourde),
+        // accrochées aux stations parentes et enrichies de la couleur officielle de la ligne
+        // (route_color) pour un rendu type plan RATP.
         String sql =
-            "SELECT DISTINCT s1.stop_id AS fid, s1.stop_lat::float AS flat, s1.stop_lon::float AS flon, "
-            + "s2.stop_id AS tid, s2.stop_lat::float AS tlat, s2.stop_lon::float AS tlon "
+            "SELECT r.route_id AS rid, "
+            + "COALESCE(p1.stop_id, s1.stop_id) AS fid, "
+            + "COALESCE(p1.stop_lat, s1.stop_lat)::float AS flat, "
+            + "COALESCE(p1.stop_lon, s1.stop_lon)::float AS flon, "
+            + "COALESCE(p2.stop_id, s2.stop_id) AS tid, "
+            + "COALESCE(p2.stop_lat, s2.stop_lat)::float AS tlat, "
+            + "COALESCE(p2.stop_lon, s2.stop_lon)::float AS tlon, "
+            + "MIN(r.route_color) AS color "
             + "FROM (SELECT trip_id, stop_id, "
             + "      LEAD(stop_id) OVER (PARTITION BY trip_id ORDER BY stop_sequence) AS nxt "
             + "      FROM stop_times) t "
+            + "JOIN trips tr ON tr.trip_id = t.trip_id "
+            + "JOIN routes r ON r.route_id = tr.route_id "
             + "JOIN stops s1 ON s1.stop_id = t.stop_id "
             + "JOIN stops s2 ON s2.stop_id = t.nxt "
-            + "WHERE t.nxt IS NOT NULL AND s1.stop_lat IS NOT NULL AND s2.stop_lat IS NOT NULL";
+            + "LEFT JOIN stops p1 ON p1.stop_id = s1.parent_station "
+            + "LEFT JOIN stops p2 ON p2.stop_id = s2.parent_station "
+            + "WHERE t.nxt IS NOT NULL AND s1.stop_lat IS NOT NULL AND s2.stop_lat IS NOT NULL "
+            + "GROUP BY 1, 2, 3, 4, 5, 6, 7";
 
         Map<String, Integer> idx = new LinkedHashMap<>();
-        List<int[]>          edgeIdx = new ArrayList<>();
-        List<Double>         edgeW   = new ArrayList<>();
+        Map<String, List<KEdge>> routeEdges = new LinkedHashMap<>();
 
         try (Connection conn = Database.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql);
@@ -1967,13 +1989,49 @@ public class AppWindow extends JFrame {
                 idx.putIfAbsent(tid, idx.size());
                 int fi = idx.get(fid), ti = idx.get(tid);
                 if (fi == ti) continue;
-                edgeIdx.add(new int[]{fi, ti});
-                edgeW.add(Calculation.haversine(flat, flon, tlat, tlon));
+                routeEdges.computeIfAbsent(rs.getString("rid"), k -> new ArrayList<>())
+                        .add(new KEdge(fi, ti,
+                                Calculation.haversine(flat, flon, tlat, tlon),
+                                new double[]{flat, flon, tlat, tlon},
+                                rs.getString("color")));
             }
         }
 
         int n = idx.size();
-        if (n == 0) return new String[]{"<html>Aucune donnée disponible.</html>", null};
+        if (n == 0) return new Object[]{"<html>Aucune donnée disponible.</html>", null, null};
+
+        // Filtrage des sauts express (RER notamment) : au sein d'une même ligne, une arête
+        // que l'on peut remplacer par un chemin d'autres arêtes de longueur comparable
+        // (<= 2x) est un trajet direct qui saute des gares : on ne la trace pas.
+        List<KEdge> kept = new ArrayList<>();
+        for (List<KEdge> edges : routeEdges.values()) {
+            Map<Integer, List<KEdge>> adj = new HashMap<>();
+            for (KEdge e : edges) {
+                adj.computeIfAbsent(e.fi, k -> new ArrayList<>()).add(e);
+                adj.computeIfAbsent(e.ti, k -> new ArrayList<>()).add(e);
+            }
+            List<KEdge> sorted = new ArrayList<>(edges);
+            sorted.sort((x, y) -> Double.compare(y.w, x.w));      // plus longues d'abord
+            for (KEdge e : sorted) {
+                if (kAltPath(adj, e, 2.0 * e.w) <= 2.0 * e.w) e.removed = true;
+            }
+            for (KEdge e : edges) {
+                if (!e.removed) kept.add(e);
+            }
+        }
+
+        // Arêtes dédupliquées entre lignes pour les statistiques (Kruskal inchangé).
+        Map<Long, KEdge> uniq = new LinkedHashMap<>();
+        for (KEdge e : kept) {
+            long key = (long) Math.min(e.fi, e.ti) * 1_000_000L + Math.max(e.fi, e.ti);
+            uniq.putIfAbsent(key, e);
+        }
+        List<int[]>  edgeIdx = new ArrayList<>();
+        List<Double> edgeW   = new ArrayList<>();
+        for (KEdge e : uniq.values()) {
+            edgeIdx.add(new int[]{e.fi, e.ti});
+            edgeW.add(e.w);
+        }
 
         // Trier les arêtes par poids
         Integer[] order = new Integer[edgeIdx.size()];
@@ -1994,6 +2052,16 @@ public class AppWindow extends JFrame {
                 mstEdges++;
                 totalDist += edgeW.get(i);
             }
+        }
+
+        // Rendu carte : réseau complet filtré (toutes les arêtes station à station hors
+        // sauts express, couleurs de ligne), sans les trous du seul arbre couvrant.
+        List<MapPanel.RouteSeg> segs = new ArrayList<>();
+        for (KEdge e : kept) {
+            double[] p = e.pts;
+            segs.add(new MapPanel.RouteSeg(
+                    List.of(new double[]{p[0], p[1]}, new double[]{p[2], p[3]}),
+                    routeColor(new String[]{null, e.color}), false));
         }
 
         // Taille de chaque composante
@@ -2028,7 +2096,51 @@ public class AppWindow extends JFrame {
         }
         det.append("</table></body></html>");
 
-        return new String[]{summary, det.toString()};
+        return new Object[]{summary, det.toString(), segs};
+    }
+
+    // Arête d'une ligne (indices de stations dans idx), pour le filtrage des sauts express.
+    private static class KEdge {
+        final int fi, ti;
+        final double w;
+        final double[] pts;    // {flat, flon, tlat, tlon}
+        final String color;
+        boolean removed = false;
+
+        KEdge(int fi, int ti, double w, double[] pts, String color) {
+            this.fi = fi;
+            this.ti = ti;
+            this.w = w;
+            this.pts = pts;
+            this.color = color;
+        }
+    }
+
+    // Plus court chemin entre les extrémités de excl dans le graphe de SA ligne, sans excl
+    // ni les arêtes déjà retirées. Abandonne dès que la distance dépasse limit.
+    private static double kAltPath(Map<Integer, List<KEdge>> adj, KEdge excl, double limit) {
+        Map<Integer, Double> dist = new HashMap<>();
+        PriorityQueue<double[]> pq = new PriorityQueue<>(Comparator.comparingDouble(a -> a[1]));
+        dist.put(excl.fi, 0.0);
+        pq.add(new double[]{excl.fi, 0.0});
+        while (!pq.isEmpty()) {
+            double[] cur = pq.poll();
+            int u = (int) cur[0];
+            double du = cur[1];
+            if (du > dist.getOrDefault(u, Double.MAX_VALUE)) continue;
+            if (u == excl.ti) return du;
+            if (du > limit) return Double.MAX_VALUE;
+            for (KEdge e : adj.getOrDefault(u, Collections.emptyList())) {
+                if (e == excl || e.removed) continue;
+                int v = (e.fi == u) ? e.ti : e.fi;
+                double nd = du + e.w;
+                if (nd < dist.getOrDefault(v, Double.MAX_VALUE)) {
+                    dist.put(v, nd);
+                    pq.add(new double[]{v, nd});
+                }
+            }
+        }
+        return Double.MAX_VALUE;
     }
 
     private int kFind(int[] p, int x) {
