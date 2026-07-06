@@ -137,7 +137,9 @@ public class AppWindow extends JFrame {
     private List<MetroLoader.StationInfo> loadStationsFromDB() throws SQLException {
         // 1. Tous les stops avec leur stop_id (pour la carte de l'itinéraire)
         String sqlAll = "SELECT stop_id, stop_name, stop_lat::float AS lat, stop_lon::float AS lon "
-                      + "FROM stops WHERE stop_lat IS NOT NULL AND stop_lon IS NOT NULL";
+                      + "FROM unique_parent_station WHERE stop_lat IS NOT NULL AND stop_lon IS NOT NULL";
+
+        String sqlAll2 = "SELECT stop_id, stop_name " + "FROM stops";
 
         Map<String, double[]> latLonByName = new LinkedHashMap<>();
         stopCoords.clear();
@@ -145,7 +147,9 @@ public class AppWindow extends JFrame {
 
         try (Connection conn = Database.getConnection();
              PreparedStatement ps = conn.prepareStatement(sqlAll);
-             ResultSet rs = ps.executeQuery()) {
+             PreparedStatement ps2 = conn.prepareStatement(sqlAll2);
+             ResultSet rs = ps.executeQuery();
+             ResultSet rs2 = ps2.executeQuery()) {
             while (rs.next()) {
                 String id   = rs.getString("stop_id");
                 String name = fixEncoding(rs.getString("stop_name"));
@@ -154,6 +158,11 @@ public class AppWindow extends JFrame {
                 if (id != null)   { stopCoords.put(id, new double[]{lat, lon}); }
                 if (id != null && name != null) stopIdToName.put(id, name);
                 if (name != null) latLonByName.putIfAbsent(name, new double[]{lat, lon});
+            }
+            while (rs2.next()) {
+                String id2   = rs2.getString("stop_id");
+                String name2 = fixEncoding(rs2.getString("stop_name"));
+                if(id2 != null && name2 != null) stopIdToName.put(id2, name2);
             }
         }
 
@@ -940,6 +949,7 @@ public class AppWindow extends JFrame {
         }
 
         for (Leg leg : j.destPath) {
+            System.out.println(stopIdToName);
             String fromName = stopIdToName.getOrDefault(leg.fromStop, leg.fromStop);
             String toName   = stopIdToName.getOrDefault(leg.toStop,   leg.toStop);
             if (leg.aPied) {
@@ -1170,7 +1180,7 @@ public class AppWindow extends JFrame {
     private void lancerBFS() {
         setResultat("<html><i>BFS en cours…</i></html>", null);
         SwingWorker<String[], Void> w = new SwingWorker<>() {
-            @Override protected String[] doInBackground() throws Exception { return calculerBFS(); }
+            @Override protected String[] doInBackground() throws Exception { return calculerBFS2(); }
             @Override protected void done() {
                 try {
                     String[] r = get(120, java.util.concurrent.TimeUnit.SECONDS);
@@ -1265,6 +1275,26 @@ public class AppWindow extends JFrame {
         det.append("</table></body></html>");
 
         return new String[]{sumSb.toString(), det.toString()};
+    }
+
+    private String[] calculerBFS2() throws Exception {
+        // 1. Connexion et chargement des données (exécuté en tâche de fond)
+        Connection connection = SupabaseConnector.getConnection();
+        DataLoader loader = new DataLoader(connection);
+        Graph graph = GraphBuilder.build(loader);
+
+        // 2. Appel de ta logique BFS
+        boolean connected = BFS.isConnected(graph);
+
+        // 3. Préparation des résultats pour l'affichage (index 0 = titre/statut, index 1 = détails)
+        String statut = connected
+                ? "<html><b style='color:#10B981'>Le graphe est connexe (Connected)</b></html>"
+                : "<html><b style='color:#EF4444'>Le graphe n'est pas connexe (Not connected)</b></html>";
+
+        String details = "Nombre total de sommets : " + graph.getVertices().size();
+
+        // On retourne le tableau attendu par le SwingWorker [r[0], r[1]]
+        return new String[]{statut, details};
     }
 
     // ── PMR accessibles ───────────────────────────────────────────
