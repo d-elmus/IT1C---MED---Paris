@@ -3,6 +3,9 @@ import javax.swing.border.*;
 import java.awt.*;
 import java.awt.event.*;
 import java.io.*;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.sql.*;
 import java.util.*;
@@ -21,6 +24,10 @@ public class AppWindow extends JFrame {
     private final JButton detailBtn  = new JButton("Voir les détails →");
     private String        detailHtml = null;
 
+    // Bouton principal de recherche (désactivé pendant le calcul, anti double-clic)
+    private JButton searchBtn;
+    private static final String SEARCH_LABEL = "Rechercher un itinéraire  →";
+
     // Station name → coordonnées (pour appel RAPTOR)
     private final Map<String, MetroLoader.StationInfo> stationMap  = new HashMap<>();
     // stop_id → [lat, lon] (pour tracer l'itinéraire sur la carte)
@@ -29,9 +36,64 @@ public class AppWindow extends JFrame {
     private final Map<String, String>                  stopIdToName = new HashMap<>();
 
     private final JSpinner timeSpinner = new JSpinner(new javax.swing.SpinnerDateModel());
+    private final JSpinner dateSpinner = new JSpinner(new javax.swing.SpinnerDateModel());
     private final JButton  btnDepartAt = new JButton("Départ à");
     private final JButton  btnArriveAt = new JButton("Arrivée à");
     private boolean        isDepartTime = true;
+
+    // ── Paramètres de recherche (section PARAMÈTRES) ──────────────
+    private final JSpinner spnRayonDepart  = new JSpinner(new SpinnerNumberModel(2000, 100, 5000, 100));
+    private final JSpinner spnRayonArrivee = new JSpinner(new SpinnerNumberModel(500, 100, 5000, 100));
+    private final JSpinner spnRayonMax     = new JSpinner(new SpinnerNumberModel(4000, 500, 8000, 250));
+    private final JSpinner spnCorrespMin   = new JSpinner(new SpinnerNumberModel(120, 0, 600, 30));
+    private final JSpinner spnMaxCorresp   = new JSpinner(new SpinnerNumberModel(5, 0, 10, 1));
+    private final JSpinner spnFenetre      = new JSpinner(new SpinnerNumberModel(60, 10, 240, 10));
+    private final JSpinner spnHorizon      = new JSpinner(new SpinnerNumberModel(180, 30, 360, 15));
+    private final JCheckBox chkAutoRayon   = new JCheckBox("Extension automatique du rayon", true);
+    private final JCheckBox chkFiltreDate  = new JCheckBox("Filtrer les horaires par date", true);
+
+    // Points personnalisés : adresse géocodée ou point choisi sur la carte.
+    // Prioritaires sur la station du menu quand le texte du champ correspond.
+    private double[] customDepart  = null;
+    private double[] customArrivee = null;
+    private final Map<String, double[]> geocodeCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final String POINT_CARTE = "Point carte";
+
+    // ── Autocomplétion ────────────────────────────────────────────
+    private final List<String> allStationNames = new ArrayList<>();
+    private final Map<String, double[]> suggestionCoords = new java.util.concurrent.ConcurrentHashMap<>();
+    private boolean suppressAuto = false;
+    private static final String ADRESSE_PREFIX = "Adresse : ";
+
+    // ── Alternatives multi-objectifs ──────────────────────────────
+    // Dérivées du même résultat RAPTOR (arrivalTimes + legs), sans relancer l'algorithme.
+    private static class Alternative {
+        final String label;
+        final String tooltip;
+        final Journey journey;
+        final List<MapPanel.RouteSeg> segs;
+        final Map<String, String[]> tripInfo;
+        final int initialWalkSec;   // marche du point de départ au premier arrêt
+
+        Alternative(String label, String tooltip, Journey journey,
+                List<MapPanel.RouteSeg> segs, Map<String, String[]> tripInfo,
+                int initialWalkSec) {
+            this.label    = label;
+            this.tooltip  = tooltip;
+            this.journey  = journey;
+            this.segs     = segs;
+            this.tripInfo = tripInfo;
+            this.initialWalkSec = initialWalkSec;
+        }
+    }
+
+    private final JPanel altPanel = new JPanel(new GridLayout(0, 2, 6, 6));
+    private List<Alternative> currentAlts = new ArrayList<>();
+    private int currentAltIdx = 0;
+    // Contexte du dernier résultat (pour re-rendre lors d'un changement d'alternative)
+    private String ctxDep, ctxArr, ctxStart, ctxDeadline;
+    private Boolean ctxCal;
+    private java.time.LocalDate ctxDate;
 
     // Status
     private final JLabel statusDot   = new JLabel();
@@ -131,21 +193,80 @@ public class AppWindow extends JFrame {
             }
         };
         worker.execute();
+
+        // Bornage du sélecteur de date : uniquement la période couverte par le feed GTFS.
+        new SwingWorker<java.util.Date[], Void>() {
+            @Override protected java.util.Date[] doInBackground() { return loadCalendarRange(); }
+            @Override protected void done() {
+                try {
+                    java.util.Date[] r = get();
+                    if (r != null) applyDateBounds(r[0], r[1]);
+                } catch (Exception ignored) {}
+            }
+        }.execute();
+    }
+
+    // Période couverte par le feed GTFS (calendar + calendar_dates). null si indisponible.
+    private static java.util.Date[] loadCalendarRange() {
+        String sql = "SELECT LEAST((SELECT MIN(start_date) FROM calendar), (SELECT MIN(date) FROM calendar_dates)) AS dmin, "
+                   + "GREATEST((SELECT MAX(end_date) FROM calendar), (SELECT MAX(date) FROM calendar_dates)) AS dmax";
+        try (Connection conn = Database.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            if (rs.next()) {
+                java.sql.Date dmin = rs.getDate("dmin");
+                java.sql.Date dmax = rs.getDate("dmax");
+                if (dmin != null && dmax != null) {
+                    return new java.util.Date[]{dmin, dmax};
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("Erreur SQL (loadCalendarRange) : " + e.getMessage());
+        }
+        return null;
+    }
+
+    // Restreint le sélecteur de date à [min, max] et y ramène la valeur courante si besoin.
+    private void applyDateBounds(java.util.Date min, java.util.Date max) {
+        java.util.Date now = new java.util.Date();
+        java.util.Date init = now.before(min) ? min : (now.after(max) ? max : now);
+        dateSpinner.setModel(new javax.swing.SpinnerDateModel(init, min, max, java.util.Calendar.DAY_OF_MONTH));
+        JSpinner.DateEditor editor = new JSpinner.DateEditor(dateSpinner, "dd/MM/yyyy");
+        dateSpinner.setEditor(editor);
+        java.text.SimpleDateFormat fmt = new java.text.SimpleDateFormat("dd/MM/yyyy");
+        dateSpinner.setToolTipText("Services GTFS disponibles du " + fmt.format(min)
+                + " au " + fmt.format(max));
     }
 
     // Charge les stations depuis la table stops de Supabase
     private List<MetroLoader.StationInfo> loadStationsFromDB() throws SQLException {
         // 1. Tous les stops avec leur stop_id (pour la carte de l'itinéraire)
         String sqlAll = "SELECT stop_id, stop_name, stop_lat::float AS lat, stop_lon::float AS lon "
-                      + "FROM stops WHERE stop_lat IS NOT NULL AND stop_lon IS NOT NULL";
+                      + "FROM unique_parent_station WHERE stop_lat IS NOT NULL AND stop_lon IS NOT NULL";
+
+        String sqlAll2 = "SELECT stop_id, stop_name " + "FROM stops";
+
+        // Requête complémentaire : stations dont au moins un quai est accessible PMR
+        // (le flag wheelchair_boarding est porté par les quais enfants, pas par les parents).
+        String sqlPmr = "SELECT DISTINCT COALESCE(NULLIF(parent_station,''), stop_id) AS sid "
+                      + "FROM stops WHERE wheelchair_boarding = 1";
 
         Map<String, double[]> latLonByName = new LinkedHashMap<>();
+        Set<String> pmrIds   = new HashSet<>();
+        Set<String> pmrNames = new HashSet<>();
         stopCoords.clear();
         stopIdToName.clear();
 
         try (Connection conn = Database.getConnection();
              PreparedStatement ps = conn.prepareStatement(sqlAll);
-             ResultSet rs = ps.executeQuery()) {
+             PreparedStatement ps2 = conn.prepareStatement(sqlAll2);
+             PreparedStatement ps3 = conn.prepareStatement(sqlPmr);
+             ResultSet rs3 = ps3.executeQuery();
+             ResultSet rs = ps.executeQuery();
+             ResultSet rs2 = ps2.executeQuery()) {
+            while (rs3.next()) {
+                pmrIds.add(rs3.getString("sid"));
+            }
             while (rs.next()) {
                 String id   = rs.getString("stop_id");
                 String name = fixEncoding(rs.getString("stop_name"));
@@ -154,13 +275,19 @@ public class AppWindow extends JFrame {
                 if (id != null)   { stopCoords.put(id, new double[]{lat, lon}); }
                 if (id != null && name != null) stopIdToName.put(id, name);
                 if (name != null) latLonByName.putIfAbsent(name, new double[]{lat, lon});
+                if (id != null && name != null && pmrIds.contains(id)) pmrNames.add(name);
+            }
+            while (rs2.next()) {
+                String id2   = rs2.getString("stop_id");
+                String name2 = fixEncoding(rs2.getString("stop_name"));
+                if(id2 != null && name2 != null) stopIdToName.put(id2, name2);
             }
         }
 
         // 2. Construction de la liste triée de stations
         List<MetroLoader.StationInfo> list = new ArrayList<>();
         latLonByName.forEach((name, ll) ->
-            list.add(new MetroLoader.StationInfo(name, ll[0], ll[1])));
+            list.add(new MetroLoader.StationInfo(name, ll[0], ll[1], pmrNames.contains(name))));
         list.sort(Comparator.comparing(s -> s.name));
         return list;
     }
@@ -299,15 +426,22 @@ public class AppWindow extends JFrame {
     }
 
     private void populateCombos(List<MetroLoader.StationInfo> stations) {
-        stationMap.clear();
-        departBox.removeAllItems();
-        arriveeBox.removeAllItems();
-        departBox.addItem("— Sélectionner —");
-        arriveeBox.addItem("— Sélectionner —");
-        for (MetroLoader.StationInfo s : stations) {
-            stationMap.put(s.name, s);
-            departBox.addItem(s.name);
-            arriveeBox.addItem(s.name);
+        suppressAuto = true;
+        try {
+            stationMap.clear();
+            allStationNames.clear();
+            departBox.removeAllItems();
+            arriveeBox.removeAllItems();
+            departBox.addItem("— Sélectionner —");
+            arriveeBox.addItem("— Sélectionner —");
+            for (MetroLoader.StationInfo s : stations) {
+                stationMap.put(s.name, s);
+                allStationNames.add(s.name);
+                departBox.addItem(s.name);
+                arriveeBox.addItem(s.name);
+            }
+        } finally {
+            suppressAuto = false;
         }
         // Fige la largeur préférée des combos pour éviter l'expansion au chargement
         Dimension d = new Dimension(1, departBox.getPreferredSize().height);
@@ -371,16 +505,27 @@ public class AppWindow extends JFrame {
         // ── ITINÉRAIRE section ─────────────────────────────────────
         inner.add(sectionLabel("ITINÉRAIRE"));
         inner.add(vgap(10));
-        inner.add(buildStationField(departBox, GREEN_DOT));
+        inner.add(buildStationField(departBox, GREEN_DOT, true));
         inner.add(vgap(6));
-        inner.add(buildStationField(arriveeBox, BLUE_DOT));
-        inner.add(vgap(14));
+        inner.add(buildStationField(arriveeBox, BLUE_DOT, false));
+        inner.add(vgap(4));
+        inner.add(buildSwapRow());
+        inner.add(vgap(10));
 
         inner.add(buildTimeRow());
+        inner.add(vgap(6));
+        inner.add(buildDateRow());
         inner.add(vgap(16));
 
         inner.add(buildSearchButton());
-        inner.add(vgap(14));
+        inner.add(vgap(6));
+
+        // Barre des alternatives multi-objectifs (vide tant qu'aucun résultat)
+        altPanel.setOpaque(false);
+        altPanel.setAlignmentX(LEFT_ALIGNMENT);
+        altPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 0));
+        inner.add(altPanel);
+        inner.add(vgap(8));
 
         inner.add(buildResultCard());
 
@@ -396,6 +541,15 @@ public class AppWindow extends JFrame {
         detailBtn.setVisible(false);
         detailBtn.addActionListener(e -> ouvrirDetail());
         inner.add(detailBtn);
+        inner.add(vgap(18));
+
+        inner.add(buildDivider());
+        inner.add(vgap(14));
+
+        // ── PARAMÈTRES section ─────────────────────────────────────
+        inner.add(sectionLabel("PARAMÈTRES"));
+        inner.add(vgap(8));
+        inner.add(buildParamsPanel());
         inner.add(vgap(18));
 
         inner.add(buildDivider());
@@ -571,7 +725,9 @@ public class AppWindow extends JFrame {
         return btn;
     }
 
-    private JPanel buildStationField(JComboBox<String> box, Color dotColor) {
+    // Champ depart/arrivee : menu des stations (editable : on peut y taper une adresse)
+    // + bouton "Carte" pour choisir le point directement sur la carte.
+    private JPanel buildStationField(JComboBox<String> box, Color dotColor, boolean isDepart) {
         JPanel field = new JPanel(new BorderLayout(8, 0)) {
             @Override
             protected void paintComponent(Graphics g) {
@@ -613,9 +769,163 @@ public class AppWindow extends JFrame {
         box.setOpaque(false);
         box.setBorder(null);
 
+        // Editable : permet de taper une adresse libre (geocodee a la recherche).
+        box.setEditable(true);
+        Component edComp = box.getEditor().getEditorComponent();
+        if (edComp instanceof JTextField ed) {
+            ed.setOpaque(false);
+            ed.setBorder(null);
+            ed.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+            ed.setForeground(TEXT_DARK);
+        }
+        // Autocomplétion : stations filtrées pendant la frappe + suggestions d'adresses.
+        installAutocomplete(box);
+        // Une station choisie dans la liste remplace le point personnalise.
+        box.addActionListener(e -> {
+            Object sel = box.getSelectedItem();
+            if (sel != null && stationMap.containsKey(sel.toString())) {
+                if (isDepart) customDepart = null; else customArrivee = null;
+                mapPanel.setPointMarkers(customDepart, customArrivee);
+            }
+        });
+
+        // Bouton "Carte" : le prochain clic sur la carte definit ce point.
+        JButton pick = new JButton("Carte");
+        pick.setUI(new javax.swing.plaf.basic.BasicButtonUI());
+        pick.setFont(new Font("Segoe UI", Font.BOLD, 10));
+        pick.setForeground(LABEL_GREY);
+        pick.setBackground(Color.WHITE);
+        pick.setOpaque(true);
+        pick.setContentAreaFilled(true);
+        pick.setFocusPainted(false);
+        pick.setBorder(BorderFactory.createLineBorder(BORDER_CLR));
+        pick.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        pick.setPreferredSize(new Dimension(52, 26));
+        pick.setToolTipText("Choisir ce point directement sur la carte");
+        pick.addActionListener(e -> mapPanel.startPointPick(pt -> {
+            String label = String.format("%s (%.5f, %.5f)", POINT_CARTE, pt[0], pt[1]);
+            if (isDepart) { customDepart = pt; departBox.setSelectedItem(label); }
+            else          { customArrivee = pt; arriveeBox.setSelectedItem(label); }
+            mapPanel.setPointMarkers(customDepart, customArrivee);
+        }));
+
         field.add(dot, BorderLayout.WEST);
         field.add(box, BorderLayout.CENTER);
+        field.add(pick, BorderLayout.EAST);
         return field;
+    }
+
+    // Petit lien "Inverser" sous les deux champs : echange depart et arrivee
+    // (textes, points personnalises et marqueurs).
+    private JPanel buildSwapRow() {
+        JPanel row = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+        row.setOpaque(false);
+        row.setAlignmentX(LEFT_ALIGNMENT);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 18));
+
+        JButton swap = new JButton("Inverser départ / arrivée");
+        swap.setUI(new javax.swing.plaf.basic.BasicButtonUI());
+        swap.setFont(new Font("Segoe UI", Font.BOLD, 10));
+        swap.setForeground(BLUE_DARK);
+        swap.setOpaque(false);
+        swap.setContentAreaFilled(false);
+        swap.setBorderPainted(false);
+        swap.setFocusPainted(false);
+        swap.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        swap.addActionListener(e -> inverserDepartArrivee());
+        row.add(swap);
+        return row;
+    }
+
+    private void inverserDepartArrivee() {
+        suppressAuto = true;
+        try {
+            double[] oldDep = customDepart;
+            double[] oldArr = customArrivee;
+            Object dSel = departBox.getSelectedItem();
+            Object aSel = arriveeBox.getSelectedItem();
+            departBox.setSelectedItem(aSel == null ? "" : aSel.toString());
+            arriveeBox.setSelectedItem(dSel == null ? "" : dSel.toString());
+            // Apres les setSelectedItem (les listeners peuvent remettre les points a null)
+            customDepart  = oldArr;
+            customArrivee = oldDep;
+            mapPanel.setPointMarkers(customDepart, customArrivee);
+        } finally {
+            suppressAuto = false;
+        }
+    }
+
+    // Ligne "Date du trajet" : la date sert au filtre calendrier (services actifs ce jour-la).
+    private JPanel buildDateRow() {
+        JPanel row = new JPanel(new GridLayout(1, 2, 6, 0));
+        row.setOpaque(false);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 34));
+        row.setAlignmentX(LEFT_ALIGNMENT);
+
+        JLabel lbl = new JLabel("Date du trajet");
+        lbl.setFont(new Font("Segoe UI", Font.BOLD, 11));
+        lbl.setForeground(LABEL_GREY);
+
+        JSpinner.DateEditor editor = new JSpinner.DateEditor(dateSpinner, "dd/MM/yyyy");
+        dateSpinner.setEditor(editor);
+        dateSpinner.setValue(new java.util.Date());
+        dateSpinner.setFont(new Font("Segoe UI", Font.BOLD, 13));
+        dateSpinner.setBorder(BorderFactory.createLineBorder(BORDER_CLR));
+        dateSpinner.setBackground(FIELD_BG);
+
+        row.add(lbl);
+        row.add(dateSpinner);
+        return row;
+    }
+
+    // Section PARAMÈTRES : reglages de la recherche (rayons, correspondances, horizon)
+    // et options (extension auto du rayon, filtre calendrier).
+    private JPanel buildParamsPanel() {
+        JPanel panel = new JPanel();
+        panel.setOpaque(false);
+        panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+        panel.setAlignmentX(LEFT_ALIGNMENT);
+
+        JPanel grid = new JPanel(new GridLayout(0, 2, 8, 5));
+        grid.setOpaque(false);
+        grid.setAlignmentX(LEFT_ALIGNMENT);
+        addParamRow(grid, "Rayon départ (m)",        spnRayonDepart);
+        addParamRow(grid, "Rayon arrivée (m)",       spnRayonArrivee);
+        addParamRow(grid, "Rayon maximal auto (m)",  spnRayonMax);
+        addParamRow(grid, "Correspondance min. (s)", spnCorrespMin);
+        addParamRow(grid, "Correspondances max.",    spnMaxCorresp);
+        addParamRow(grid, "Fenêtre de départ (min)", spnFenetre);
+        addParamRow(grid, "Horizon de recherche (min)", spnHorizon);
+        grid.setMaximumSize(new Dimension(Integer.MAX_VALUE, 7 * 27 + 6 * 5));
+        panel.add(grid);
+        panel.add(vgap(8));
+
+        styleCheck(chkAutoRayon,
+            "Si aucun arrêt n'est trouvé dans le rayon, il augmente par paliers jusqu'au rayon maximal");
+        styleCheck(chkFiltreDate,
+            "N'utilise que les trips dont le service circule à la date choisie (calendar / calendar_dates)");
+        panel.add(chkAutoRayon);
+        panel.add(chkFiltreDate);
+        return panel;
+    }
+
+    private void addParamRow(JPanel grid, String label, JSpinner spinner) {
+        JLabel l = new JLabel(label);
+        l.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        l.setForeground(LABEL_GREY);
+        spinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        spinner.setBorder(BorderFactory.createLineBorder(BORDER_CLR));
+        grid.add(l);
+        grid.add(spinner);
+    }
+
+    private void styleCheck(JCheckBox c, String tooltip) {
+        c.setOpaque(false);
+        c.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        c.setForeground(TEXT_DARK);
+        c.setFocusPainted(false);
+        c.setAlignmentX(LEFT_ALIGNMENT);
+        c.setToolTipText(tooltip);
     }
 
     private JPanel buildTimeRow() {
@@ -652,7 +962,7 @@ public class AppWindow extends JFrame {
     }
 
     private JButton buildSearchButton() {
-        JButton btn = new JButton("Rechercher un itinéraire  →") {
+        JButton btn = new JButton(SEARCH_LABEL) {
             @Override
             protected void paintComponent(Graphics g) {
                 Graphics2D g2 = (Graphics2D) g.create();
@@ -685,6 +995,7 @@ public class AppWindow extends JFrame {
             @Override public void mouseExited(MouseEvent e)  { btn.setBackground(BLUE); btn.repaint(); }
         });
         btn.addActionListener(e -> rechercher());
+        searchBtn = btn;
         return btn;
     }
 
@@ -717,20 +1028,14 @@ public class AppWindow extends JFrame {
     // ── Actions ───────────────────────────────────────────────────
 
     private void rechercher() {
-        String d = (String) departBox.getSelectedItem();
-        String a = (String) arriveeBox.getSelectedItem();
-        if (d == null || d.startsWith("—") || a == null || a.startsWith("—")) {
-            resultLabel.setText("<html><span style='color:#EF4444'>Sélectionnez un départ et une arrivée.</span></html>");
+        String d = departBox.getSelectedItem() != null ? departBox.getSelectedItem().toString().trim() : "";
+        String a = arriveeBox.getSelectedItem() != null ? arriveeBox.getSelectedItem().toString().trim() : "";
+        if (d.isEmpty() || d.startsWith("—") || a.isEmpty() || a.startsWith("—")) {
+            resultLabel.setText("<html><span style='color:#EF4444'>Sélectionnez un départ et une arrivée (station, adresse ou point carte).</span></html>");
             return;
         }
         if (d.equals(a)) {
             resultLabel.setText("<html><span style='color:#EF4444'>Le départ et l'arrivée sont identiques.</span></html>");
-            return;
-        }
-        MetroLoader.StationInfo origin = stationMap.get(d);
-        MetroLoader.StationInfo dest   = stationMap.get(a);
-        if (origin == null || dest == null) {
-            resultLabel.setText("<html><i>Coordonnées introuvables pour ces stations.</i></html>");
             return;
         }
 
@@ -750,27 +1055,98 @@ public class AppWindow extends JFrame {
             startTime = String.format("%02d:%02d:00", spinH, spinM);
         }
 
-        resultLabel.setText("<html><i>Calcul en cours…</i></html>");
+        // Date du trajet (filtre calendrier)
+        java.util.Calendar dc = java.util.Calendar.getInstance();
+        dc.setTime((java.util.Date) dateSpinner.getValue());
+        final java.time.LocalDate travelDate = java.time.LocalDate.of(
+                dc.get(java.util.Calendar.YEAR),
+                dc.get(java.util.Calendar.MONTH) + 1,
+                dc.get(java.util.Calendar.DAY_OF_MONTH));
+        final boolean filtreDate = chkFiltreDate.isSelected();
 
-        double oLat = origin.lat, oLon = origin.lon;
-        double dLat = dest.lat,   dLon = dest.lon;
+        // Paramètres de recherche (section PARAMÈTRES)
+        final double rayonDepart  = ((Number) spnRayonDepart.getValue()).doubleValue();
+        final double rayonArrivee = ((Number) spnRayonArrivee.getValue()).doubleValue();
+        final double rayonMax     = ((Number) spnRayonMax.getValue()).doubleValue();
+        final boolean autoRayon   = chkAutoRayon.isSelected();
+        final double maxRayonDepart  = autoRayon ? Math.max(rayonMax, rayonDepart)  : rayonDepart;
+        final double maxRayonArrivee = autoRayon ? Math.max(rayonMax, rayonArrivee) : rayonArrivee;
+        final int correspMin = ((Number) spnCorrespMin.getValue()).intValue();
+        final int maxCorresp = ((Number) spnMaxCorresp.getValue()).intValue();
+        final int fenetre    = ((Number) spnFenetre.getValue()).intValue();
+        final int horizon    = ((Number) spnHorizon.getValue()).intValue();
+
+        final double[] customO = customDepart;
+        final double[] customA = customArrivee;
+
+        resultLabel.setText("<html><i>Calcul en cours…</i></html>");
+        // Bouton désactivé le temps du calcul (évite les recherches en double)
+        searchBtn.setEnabled(false);
+        searchBtn.setText("Recherche en cours…");
+        searchBtn.setBackground(new Color(147, 197, 253));
+        searchBtn.repaint();
 
         SwingWorker<Object[], Void> worker = new SwingWorker<>() {
             @Override
             protected Object[] doInBackground() throws Exception {
+                // Résolution des extrémités : point carte > station connue > adresse géocodée.
+                double[] o = resolveEndpoint(d, customO, "départ");
+                double[] t = resolveEndpoint(a, customA, "arrivée");
+
+                // Services actifs à la date choisie (null = filtre indisponible ou désactivé).
+                Set<String> services = filtreDate ? Calculation.getActiveServiceIds(travelDate) : null;
+                Boolean calendarState = filtreDate ? Boolean.valueOf(services != null) : null;
+
                 Journey j = (arrivalDeadline != null)
-                        ? findJourneyByArrival(oLat, oLon, dLat, dLon, arrivalDeadline)
-                        : Calculation.findJourney(oLat, oLon, dLat, dLon, 2000, 500, startTime, 60, 120, 5, 180);
-                List<double[]> route = buildFullRoute(j);
-                return new Object[]{j, route};
+                        ? Calculation.findJourneyByArrivalEx(o[0], o[1], t[0], t[1],
+                                rayonDepart, rayonArrivee, arrivalDeadline,
+                                correspMin, maxCorresp, horizon,
+                                services, maxRayonDepart, maxRayonArrivee)
+                        : Calculation.findJourneyEx(o[0], o[1], t[0], t[1],
+                                rayonDepart, rayonArrivee, startTime, fenetre,
+                                correspMin, maxCorresp, horizon,
+                                services, maxRayonDepart, maxRayonArrivee);
+
+                Map<String, String[]> tripInfo = loadTripInfo(j);
+                List<MapPanel.RouteSeg> segs = buildRouteSegments(j, o, t, tripInfo);
+
+                // Alternatives multi-objectifs (mode "Départ à" uniquement : le RAPTOR
+                // inverse n'expose pas les legs nécessaires à la reconstruction).
+                List<Alternative> alts = (arrivalDeadline == null && j.destStopId != null)
+                        ? computeAlternatives(j, o, t, rayonArrivee, maxRayonArrivee,
+                                startTime, segs, tripInfo)
+                        : new ArrayList<>();
+                int initialWalkSec = computeInitialWalkSec(j, o);
+                return new Object[]{j, segs, tripInfo, calendarState, o, t, alts, initialWalkSec};
             }
             @Override
             protected void done() {
                 try {
                     Object[] result = get(60, java.util.concurrent.TimeUnit.SECONDS);
                     Journey j = (Journey) result[0];
-                    @SuppressWarnings("unchecked") List<double[]> route = (List<double[]>) result[1];
-                    afficherResultat(d, a, startTime, j, route, arrivalDeadline);
+                    @SuppressWarnings("unchecked") List<MapPanel.RouteSeg> segs = (List<MapPanel.RouteSeg>) result[1];
+                    @SuppressWarnings("unchecked") Map<String, String[]> tripInfo = (Map<String, String[]>) result[2];
+                    @SuppressWarnings("unchecked") List<Alternative> alts = (List<Alternative>) result[6];
+                    // Marqueurs : uniquement pour les points hors station (adresse ou point carte).
+                    double[] oMark = stationMap.containsKey(d) ? null : (double[]) result[4];
+                    double[] tMark = stationMap.containsKey(a) ? null : (double[]) result[5];
+                    mapPanel.setPointMarkers(oMark, tMark);
+
+                    // Contexte pour le re-rendu lors d'un changement d'alternative
+                    ctxDep = d; ctxArr = a; ctxStart = startTime;
+                    ctxDeadline = arrivalDeadline;
+                    ctxCal = (Boolean) result[3];
+                    ctxDate = travelDate;
+                    currentAlts = alts;
+                    currentAltIdx = 0;
+                    renderAltBar();
+
+                    if (!alts.isEmpty()) {
+                        montrerAlternative(0);
+                    } else {
+                        afficherResultat(d, a, startTime, j, segs, tripInfo, arrivalDeadline,
+                                (Boolean) result[3], travelDate, (Integer) result[7]);
+                    }
                 } catch (java.util.concurrent.TimeoutException tex) {
                     resultLabel.setText("<html><span style='color:#EF4444'>Timeout : calcul trop long (base DB surchargée ?)</span></html>");
                 } catch (Exception ex) {
@@ -778,64 +1154,536 @@ public class AppWindow extends JFrame {
                     String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
                     System.err.println("[RAPTOR ERROR] " + msg);
                     resultLabel.setText("<html><span style='color:#EF4444'>Erreur : " + esc(msg) + "</span></html>");
+                } finally {
+                    searchBtn.setEnabled(true);
+                    searchBtn.setText(SEARCH_LABEL);
+                    searchBtn.setBackground(BLUE);
+                    searchBtn.repaint();
                 }
             }
         };
         worker.execute();
     }
 
-    private List<double[]> buildFullRoute(Journey j) {
-        if (j == null || j.destPath == null || j.destPath.isEmpty()) return Collections.emptyList();
-        List<double[]> route = new ArrayList<>();
-        String sql = "SELECT st.stop_id, s.stop_lat::float AS lat, s.stop_lon::float AS lon "
+    // Convertit le texte d'un champ en coordonnées [lat, lon] :
+    // 1) point choisi sur la carte, 2) suggestion d'adresse retenue, 3) station connue,
+    // 4) adresse libre géocodée (Nominatim).
+    private double[] resolveEndpoint(String text, double[] custom, String role) throws Exception {
+        if (custom != null && text.startsWith(POINT_CARTE)) {
+            return custom;
+        }
+        double[] sug = suggestionCoords.get(text);
+        if (sug != null) {
+            return sug;
+        }
+        MetroLoader.StationInfo s = stationMap.get(text);
+        if (s != null) {
+            return new double[]{s.lat, s.lon};
+        }
+        double[] cached = geocodeCache.get(text);
+        if (cached != null) {
+            return cached;
+        }
+        double[] geo = geocodeAddress(text);
+        if (geo == null) {
+            throw new Exception("Adresse introuvable (" + role + ") : " + text);
+        }
+        geocodeCache.put(text, geo);
+        return geo;
+    }
+
+    // Géocodage d'une adresse via Nominatim (OpenStreetMap), restreint à l'Île-de-France.
+    private static double[] geocodeAddress(String query) throws IOException {
+        List<String[]> r = geocodeSuggest(query, 1);
+        if (r.isEmpty()) return null;
+        return new double[]{Double.parseDouble(r.get(0)[0]), Double.parseDouble(r.get(0)[1])};
+    }
+
+    // Jusqu'à 'limit' suggestions Nominatim pour un texte : {lat, lon, libellé}.
+    private static List<String[]> geocodeSuggest(String query, int limit) throws IOException {
+        String url = "https://nominatim.openstreetmap.org/search?format=json&limit=" + limit
+                   + "&countrycodes=fr&viewbox=1.35,49.30,3.60,48.05&bounded=1&q="
+                   + URLEncoder.encode(query, StandardCharsets.UTF_8);
+        HttpURLConnection conn = (HttpURLConnection) URI.create(url).toURL().openConnection();
+        conn.setRequestProperty("User-Agent", "MetroEfreiDodo/1.0 Java Swing educational");
+        conn.setConnectTimeout(6000);
+        conn.setReadTimeout(8000);
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader br = new BufferedReader(
+                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line);
+        }
+        List<String[]> out = new ArrayList<>();
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "\"lat\"\\s*:\\s*\"(-?[0-9.]+)\"\\s*,\\s*\"lon\"\\s*:\\s*\"(-?[0-9.]+)\""
+                + "[^{}]*?\"display_name\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").matcher(sb);
+        while (m.find() && out.size() < limit) {
+            String name = m.group(3).replace("\\\"", "\"").replace("\\/", "/");
+            out.add(new String[]{m.group(1), m.group(2), name});
+        }
+        return out;
+    }
+
+    // ── Autocomplétion ─────────────────────────────────────────────
+    // Pendant la frappe : filtre immédiat des stations (insensible aux accents), puis
+    // après une pause de 500 ms, jusqu'à 3 suggestions d'adresses Nominatim en fin de liste.
+    private void installAutocomplete(JComboBox<String> box) {
+        if (!(box.getEditor().getEditorComponent() instanceof JTextField ed)) return;
+
+        javax.swing.Timer debounce = new javax.swing.Timer(500, e -> {
+            String q = ed.getText().trim();
+            if (q.length() < 4 || q.startsWith(POINT_CARTE)
+                    || stationMap.containsKey(q) || suggestionCoords.containsKey(q)) return;
+            new SwingWorker<List<String[]>, Void>() {
+                @Override protected List<String[]> doInBackground() throws Exception {
+                    return geocodeSuggest(q, 3);
+                }
+                @Override protected void done() {
+                    try {
+                        List<String[]> res = get();
+                        // Le texte a changé entre-temps : suggestions obsolètes.
+                        if (!ed.getText().trim().equals(q) || res.isEmpty()) return;
+                        List<String> labels = new ArrayList<>();
+                        for (String[] r : res) {
+                            String label = ADRESSE_PREFIX + shorten(r[2], 70);
+                            suggestionCoords.put(label, new double[]{
+                                    Double.parseDouble(r[0]), Double.parseDouble(r[1])});
+                            labels.add(label);
+                        }
+                        refreshSuggestions(box, ed, q, labels);
+                    } catch (Exception ignored) {}
+                }
+            }.execute();
+        });
+        debounce.setRepeats(false);
+
+        ed.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+            private void onChange() {
+                if (suppressAuto) return;
+                SwingUtilities.invokeLater(() -> {
+                    if (suppressAuto) return;
+                    refreshSuggestions(box, ed, ed.getText().trim(), Collections.emptyList());
+                    debounce.restart();
+                });
+            }
+            @Override public void insertUpdate(javax.swing.event.DocumentEvent e)  { onChange(); }
+            @Override public void removeUpdate(javax.swing.event.DocumentEvent e)  { onChange(); }
+            @Override public void changedUpdate(javax.swing.event.DocumentEvent e) { onChange(); }
+        });
+    }
+
+    // Reconstruit la liste déroulante : stations filtrées (max 12) + adresses proposées.
+    private void refreshSuggestions(JComboBox<String> box, JTextField ed,
+            String text, List<String> addressLabels) {
+        if (!ed.isFocusOwner()) return;               // champ non actif : ne rien faire
+        // Une valeur déjà résolue est sélectionnée : pas de nouvelles suggestions.
+        if (stationMap.containsKey(text) || suggestionCoords.containsKey(text)
+                || text.startsWith(POINT_CARTE)) {
+            box.hidePopup();
+            return;
+        }
+        suppressAuto = true;
+        try {
+            String norm = normalize(text);
+            DefaultComboBoxModel<String> m = new DefaultComboBoxModel<>();
+            if (norm.isEmpty()) {
+                // Champ vidé : liste complète restaurée.
+                m.addElement("— Sélectionner —");
+                for (String s : allStationNames) m.addElement(s);
+                box.setModel(m);
+                ed.setText("");
+                box.hidePopup();
+                return;
+            }
+            for (String s : allStationNames) {
+                if (normalize(s).contains(norm)) {
+                    m.addElement(s);
+                    if (m.getSize() >= 12) break;
+                }
+            }
+            for (String a : addressLabels) m.addElement(a);
+            box.setModel(m);
+            box.setSelectedItem(null);
+            ed.setText(text);
+            box.hidePopup();
+            if (m.getSize() > 0 && box.isShowing()) box.showPopup();
+        } finally {
+            suppressAuto = false;
+        }
+    }
+
+    // Minuscules sans accents, pour un filtrage tolérant.
+    private static String normalize(String s) {
+        String n = java.text.Normalizer.normalize(s.toLowerCase(Locale.FRENCH),
+                java.text.Normalizer.Form.NFD);
+        return n.replaceAll("\\p{M}", "");
+    }
+
+    private static String shorten(String s, int max) {
+        return s.length() <= max ? s : s.substring(0, max - 1) + "…";
+    }
+
+    // Informations de ligne pour chaque trip du trajet : trip_id -> {nom, couleur hex}.
+    // Une seule requête pour tout le trajet, exécutée hors EDT.
+    private Map<String, String[]> loadTripInfo(Journey j) {
+        Map<String, String[]> info = new HashMap<>();
+        if (j == null || j.destPath == null) return info;
+        List<String> tripIds = new ArrayList<>();
+        for (Leg leg : j.destPath)
+            if (!leg.aPied && leg.tripId != null) tripIds.add(leg.tripId);
+        if (tripIds.isEmpty()) return info;
+        String placeholders = String.join(",", Collections.nCopies(tripIds.size(), "?"));
+        String sql = "SELECT t.trip_id, COALESCE(NULLIF(r.route_short_name,''), r.route_long_name) AS rname, "
+                   + "r.route_color FROM trips t JOIN routes r ON r.route_id = t.route_id "
+                   + "WHERE t.trip_id IN (" + placeholders + ")";
+        try (Connection conn = Database.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            for (int i = 0; i < tripIds.size(); i++) ps.setString(i + 1, tripIds.get(i));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next())
+                    info.put(rs.getString("trip_id"),
+                             new String[]{rs.getString("rname"), rs.getString("route_color")});
+            }
+        } catch (Exception e) {
+            System.err.println("[TRIP INFO ERROR] " + e.getMessage());
+        }
+        return info;
+    }
+
+    // Construit les segments à dessiner : un tronçon par leg, couleur officielle de la ligne,
+    // pointillés pour la marche, y compris la marche initiale et finale vers les points réels.
+    private List<MapPanel.RouteSeg> buildRouteSegments(Journey j, double[] originPt, double[] destPt,
+            Map<String, String[]> tripInfo) {
+        List<MapPanel.RouteSeg> segs = new ArrayList<>();
+        if (j == null || j.destPath == null || j.destPath.isEmpty()) return segs;
+        Color walkColor = new Color(75, 85, 99);
+
+        // Rendu accroché aux stations parentes : chaque point du tracé utilise les coordonnées
+        // de la station parente quand elle existe (clarté visuelle uniquement — l'algorithme
+        // conserve l'arrêt réellement choisi, quai ou arrêt enfant).
+        String sql = "SELECT st.stop_id, COALESCE(p.stop_lat, s.stop_lat)::float AS lat, "
+                   + "COALESCE(p.stop_lon, s.stop_lon)::float AS lon "
                    + "FROM stop_times st JOIN stops s ON s.stop_id = st.stop_id "
+                   + "LEFT JOIN stops p ON p.stop_id = s.parent_station "
                    + "WHERE st.trip_id = ? ORDER BY st.stop_sequence";
         try (Connection conn = Database.getConnection()) {
+            // stopCoords ne contient que les stations parentes (unique_parent_station) :
+            // les coordonnées des arrêts enfants du trajet sont résolues ici en une requête.
+            Map<String, double[]> legCoords = resolveLegCoords(conn, j);
+
+            // Marche initiale : point de départ réel -> premier arrêt (si distance non négligeable)
+            double[] firstStop = legCoords.get(j.destPath.get(0).fromStop);
+            if (originPt != null && firstStop != null
+                    && Calculation.haversine(originPt[0], originPt[1], firstStop[0], firstStop[1]) > 40) {
+                segs.add(new MapPanel.RouteSeg(List.of(originPt, firstStop), walkColor, true));
+            }
+
             for (Leg leg : j.destPath) {
+                double[] from = legCoords.get(leg.fromStop);
+                double[] to   = legCoords.get(leg.toStop);
                 if (leg.aPied || leg.tripId == null) {
-                    addIfNew(route, stopCoords.get(leg.fromStop));
-                    addIfNew(route, stopCoords.get(leg.toStop));
-                } else {
-                    List<String>   ids    = new ArrayList<>();
-                    List<double[]> coords = new ArrayList<>();
-                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                        ps.setString(1, leg.tripId);
-                        try (ResultSet rs = ps.executeQuery()) {
-                            while (rs.next()) {
-                                ids.add(rs.getString("stop_id"));
-                                coords.add(new double[]{rs.getDouble("lat"), rs.getDouble("lon")});
-                            }
+                    if (from != null && to != null && (from[0] != to[0] || from[1] != to[1]))
+                        segs.add(new MapPanel.RouteSeg(List.of(from, to), walkColor, true));
+                    continue;
+                }
+                List<String>   ids    = new ArrayList<>();
+                List<double[]> coords = new ArrayList<>();
+                try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                    ps.setString(1, leg.tripId);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            ids.add(rs.getString("stop_id"));
+                            coords.add(new double[]{rs.getDouble("lat"), rs.getDouble("lon")});
                         }
                     }
-                    int from = -1, to = -1;
-                    for (int i = 0; i < ids.size(); i++) {
-                        if (leg.fromStop.equals(ids.get(i))) from = i;
-                        if (leg.toStop.equals(ids.get(i)))   to   = i;
-                    }
-                    if (from >= 0 && to >= 0 && from <= to) {
-                        for (int i = from; i <= to; i++) addIfNew(route, coords.get(i));
-                    } else {
-                        addIfNew(route, stopCoords.get(leg.fromStop));
-                        addIfNew(route, stopCoords.get(leg.toStop));
-                    }
                 }
+                int iFrom = ids.indexOf(leg.fromStop);
+                int iTo   = ids.indexOf(leg.toStop);
+                List<double[]> pts = new ArrayList<>();
+                if (iFrom >= 0 && iTo >= 0 && iFrom <= iTo) {
+                    for (int i = iFrom; i <= iTo; i++) addIfNew(pts, coords.get(i));
+                } else {
+                    addIfNew(pts, from);
+                    addIfNew(pts, to);
+                }
+                if (pts.size() >= 2)
+                    segs.add(new MapPanel.RouteSeg(pts, routeColor(tripInfo.get(leg.tripId)), false));
+            }
+
+            // Marche finale : dernier arrêt -> point d'arrivée réel
+            double[] lastStop = legCoords.get(j.destStopId);
+            if (destPt != null && lastStop != null
+                    && Calculation.haversine(destPt[0], destPt[1], lastStop[0], lastStop[1]) > 40) {
+                segs.add(new MapPanel.RouteSeg(List.of(lastStop, destPt), walkColor, true));
             }
         } catch (Exception e) {
             System.err.println("[ROUTE BUILD ERROR] " + e.getMessage());
-            route.clear();
+            // Mode dégradé sans base : lignes droites entre les arrêts connus (stations parentes).
+            segs.clear();
             for (Leg leg : j.destPath) {
-                addIfNew(route, stopCoords.get(leg.fromStop));
-                addIfNew(route, stopCoords.get(leg.toStop));
+                double[] from = stopCoords.get(leg.fromStop);
+                double[] to   = stopCoords.get(leg.toStop);
+                if (from == null || to == null) continue;
+                segs.add(new MapPanel.RouteSeg(List.of(from, to),
+                        leg.aPied ? walkColor : routeColor(tripInfo.get(leg.tripId)), leg.aPied));
             }
         }
-        return route;
+        return segs;
     }
 
-    private Journey findJourneyByArrival(double oLat, double oLon,
-                                          double dLat, double dLon,
-                                          String deadline) throws Exception {
-        return Calculation.findJourneyByArrival(
-                oLat, oLon, dLat, dLon, 2000, 500, deadline, 120, 5, 180);
+    // Coordonnées de tous les arrêts du trajet : d'abord stopCoords (stations parentes),
+    // puis une requête unique pour les identifiants manquants (arrêts enfants), en
+    // remontant aux coordonnées de la station parente pour un rendu propre.
+    private Map<String, double[]> resolveLegCoords(Connection conn, Journey j) {
+        Map<String, double[]> map = new HashMap<>();
+        Set<String> wanted = new HashSet<>();
+        for (Leg leg : j.destPath) {
+            if (leg.fromStop != null) wanted.add(leg.fromStop);
+            if (leg.toStop   != null) wanted.add(leg.toStop);
+        }
+        if (j.destStopId != null) wanted.add(j.destStopId);
+
+        Set<String> missing = new HashSet<>();
+        for (String id : wanted) {
+            double[] c = stopCoords.get(id);
+            if (c != null) map.put(id, c);
+            else missing.add(id);
+        }
+        if (!missing.isEmpty()) {
+            String sql = "SELECT s.stop_id, COALESCE(p.stop_lat, s.stop_lat)::float AS lat, "
+                       + "COALESCE(p.stop_lon, s.stop_lon)::float AS lon "
+                       + "FROM stops s LEFT JOIN stops p ON p.stop_id = s.parent_station "
+                       + "WHERE s.stop_id = ANY(?)";
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setArray(1, conn.createArrayOf("text", missing.toArray()));
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next())
+                        map.put(rs.getString("stop_id"),
+                                new double[]{rs.getDouble("lat"), rs.getDouble("lon")});
+                }
+            } catch (SQLException e) {
+                System.err.println("[LEG COORDS ERROR] " + e.getMessage());
+            }
+        }
+        return map;
+    }
+
+    // Couleur officielle de la ligne (route_color GTFS), bleu par défaut.
+    private static Color routeColor(String[] info) {
+        if (info != null && info[1] != null && !info[1].isBlank()) {
+            try {
+                return new Color(Integer.parseInt(info[1].trim().replace("#", ""), 16));
+            } catch (NumberFormatException ignored) {}
+        }
+        return new Color(37, 99, 235);
+    }
+
+    // ── Alternatives multi-objectifs ───────────────────────────────
+    // RAPTOR fournit déjà l'heure d'arrivée de TOUS les arrêts atteignables (arrivalTimes)
+    // et de quoi reconstruire chaque chemin (legs). On dérive donc plusieurs alternatives
+    // en choisissant différents arrêts de destination selon le critère, sans relancer l'algo :
+    // plus rapide / moins de changements / moins de marche / accessible fauteuil roulant.
+    private List<Alternative> computeAlternatives(Journey base, double[] o, double[] t,
+            double rayonArrivee, double maxRayonArrivee, String startTime,
+            List<MapPanel.RouteSeg> baseSegs, Map<String, String[]> baseTripInfo) {
+
+        List<Alternative> out = new ArrayList<>();
+        // Nécessite les legs du RAPTOR avant (le mode "Arrivée à" ne les expose pas).
+        if (base == null || base.destStopId == null || base.legs == null || base.legs.isEmpty()) {
+            return out;
+        }
+
+        // Un candidat = un arrêt de destination atteint, avec ses métriques.
+        class Cand {
+            String stopId, arrival;
+            List<Leg> path;
+            int totalSec, transfers, walkSec, finalWalkSec, initialWalkSec;
+            boolean pmr;
+        }
+        List<Cand> cands = new ArrayList<>();
+
+        try (Connection conn = Database.getConnection()) {
+            List<Stops> destStops = Calculation.getNearbyStopsExpanding(
+                    conn, t[0], t[1], rayonArrivee, maxRayonArrivee);
+
+            // Chemins vers chaque arrêt candidat + tous les arrêts impliqués.
+            Map<String, List<Leg>> paths = new LinkedHashMap<>();
+            Set<String> allIds = new HashSet<>();
+            for (Stops s : destStops) {
+                String sid = s.getStop_id();
+                if (base.arrivalTimes.get(sid) == null || paths.containsKey(sid)) continue;
+                List<Leg> path = Calculation.reconstructPath(sid, base.legs);
+                paths.put(sid, path);
+                allIds.add(sid);
+                for (Leg leg : path) {
+                    if (leg.fromStop != null) allIds.add(leg.fromStop);
+                    if (leg.toStop   != null) allIds.add(leg.toStop);
+                }
+            }
+            if (paths.isEmpty()) return out;
+
+            // Coordonnées exactes + accessibilité fauteuil (quai ou station parente) en une requête.
+            Map<String, double[]> coords = new HashMap<>();
+            Map<String, Boolean>  pmr    = new HashMap<>();
+            String sql = "SELECT s.stop_id, s.stop_lat::float AS lat, s.stop_lon::float AS lon, "
+                       + "GREATEST(COALESCE(s.wheelchair_boarding,0), COALESCE(p.wheelchair_boarding,0)) AS pmr "
+                       + "FROM stops s LEFT JOIN stops p ON p.stop_id = s.parent_station "
+                       + "WHERE s.stop_id = ANY(?)";
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setArray(1, conn.createArrayOf("text", allIds.toArray()));
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        coords.put(rs.getString("stop_id"),
+                                new double[]{rs.getDouble("lat"), rs.getDouble("lon")});
+                        pmr.put(rs.getString("stop_id"), rs.getInt("pmr") == 1);
+                    }
+                }
+            }
+
+            for (Map.Entry<String, List<Leg>> e : paths.entrySet()) {
+                String sid = e.getKey();
+                List<Leg> path = e.getValue();
+                double[] sc = coords.get(sid);
+                if (sc == null) continue;
+                Cand c = new Cand();
+                c.stopId  = sid;
+                c.arrival = base.arrivalTimes.get(sid);
+                c.path    = path;
+                c.finalWalkSec = Calculation.walkSeconds(t[0], t[1], sc[0], sc[1]);
+                c.totalSec = Calculation.toSeconds(c.arrival) + c.finalWalkSec;
+                long transit = path.stream().filter(l -> !l.aPied).count();
+                c.transfers = (int) Math.max(0, transit - 1);
+                int walk = c.finalWalkSec;
+                if (!path.isEmpty()) {
+                    double[] fc = coords.get(path.get(0).fromStop);
+                    if (fc != null) {
+                        c.initialWalkSec = Calculation.walkSeconds(o[0], o[1], fc[0], fc[1]);
+                        walk += c.initialWalkSec;
+                    }
+                    for (Leg l : path) {
+                        if (l.aPied) walk += Math.max(0,
+                                Calculation.toSeconds(l.arriveTime) - Calculation.toSeconds(l.departTime));
+                    }
+                } else {
+                    walk += Calculation.walkSeconds(o[0], o[1], sc[0], sc[1]);
+                }
+                c.walkSec = walk;
+                // Accessible : tous les arrêts d'embarquement / descente / correspondance sont PMR.
+                boolean okPmr = !path.isEmpty() && pmr.getOrDefault(sid, false);
+                for (Leg l : path) {
+                    if (!pmr.getOrDefault(l.fromStop, false) || !pmr.getOrDefault(l.toStop, false)) {
+                        okPmr = false;
+                        break;
+                    }
+                }
+                c.pmr = okPmr;
+                cands.add(c);
+            }
+        } catch (Exception e) {
+            System.err.println("[ALTERNATIVES ERROR] " + e.getMessage());
+            return out;
+        }
+        if (cands.isEmpty()) return out;
+
+        // Sélection par critère (départage : heure d'arrivée totale).
+        Cand fastest = cands.stream()
+                .min(Comparator.comparingInt(c -> c.totalSec)).orElse(null);
+        Cand fewest = cands.stream()
+                .min(Comparator.<Cand>comparingInt(c -> c.transfers)
+                        .thenComparingInt(c -> c.totalSec)).orElse(null);
+        Cand leastWalk = cands.stream()
+                .min(Comparator.<Cand>comparingInt(c -> c.walkSec)
+                        .thenComparingInt(c -> c.totalSec)).orElse(null);
+        Cand pmrBest = cands.stream().filter(c -> c.pmr)
+                .min(Comparator.comparingInt(c -> c.totalSec)).orElse(null);
+
+        // Regroupement : un même chemin retenu par plusieurs critères = un seul bouton.
+        Map<Cand, List<String>> picks = new LinkedHashMap<>();
+        picks.computeIfAbsent(fastest,   k -> new ArrayList<>()).add("Plus rapide");
+        picks.computeIfAbsent(fewest,    k -> new ArrayList<>()).add("Moins de changements");
+        picks.computeIfAbsent(leastWalk, k -> new ArrayList<>()).add("Moins de marche");
+        if (pmrBest != null) {
+            picks.computeIfAbsent(pmrBest, k -> new ArrayList<>()).add("Accessible PMR");
+        }
+
+        int startSec = Calculation.toSeconds(startTime);
+        for (Map.Entry<Cand, List<String>> e : picks.entrySet()) {
+            Cand c = e.getKey();
+            if (c == null) continue;
+            Journey alt = new Journey(base.arrivalTimes, base.legs, c.stopId, c.arrival,
+                    Calculation.fromSeconds(c.totalSec), c.finalWalkSec, c.path);
+            List<MapPanel.RouteSeg> segs;
+            Map<String, String[]> info;
+            if (c.stopId.equals(base.destStopId) && baseSegs != null) {
+                segs = baseSegs;
+                info = baseTripInfo;
+            } else {
+                info = loadTripInfo(alt);
+                segs = buildRouteSegments(alt, o, t, info);
+            }
+            String tooltip = "Arrivée " + c.arrival.substring(0, 5)
+                    + " · " + c.transfers + " changement" + (c.transfers > 1 ? "s" : "")
+                    + " · " + (c.walkSec / 60) + " min de marche"
+                    + " · durée " + Math.max(0, (c.totalSec - startSec) / 60) + " min"
+                    + (c.pmr ? " · accessible PMR" : "");
+            out.add(new Alternative(String.join(" / ", e.getValue()), tooltip, alt, segs, info,
+                    c.initialWalkSec));
+        }
+        return out;
+    }
+
+    // Reconstruit la barre de boutons des alternatives (masquée s'il n'y a qu'un résultat).
+    private void renderAltBar() {
+        altPanel.removeAll();
+        if (currentAlts.size() > 1) {
+            for (int i = 0; i < currentAlts.size(); i++) {
+                final int idx = i;
+                JButton b = new JButton(currentAlts.get(i).label);
+                styleToggleBtn(b, i == currentAltIdx);
+                b.setToolTipText(currentAlts.get(i).tooltip);
+                b.addActionListener(e -> montrerAlternative(idx));
+                altPanel.add(b);
+            }
+        }
+        int rows = (altPanel.getComponentCount() + 1) / 2;
+        altPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, rows == 0 ? 0 : rows * 30 + (rows - 1) * 6));
+        altPanel.revalidate();
+        altPanel.repaint();
+    }
+
+    // Affiche l'alternative demandée et met à jour le style des boutons.
+    private void montrerAlternative(int idx) {
+        if (idx < 0 || idx >= currentAlts.size()) return;
+        currentAltIdx = idx;
+        Component[] cs = altPanel.getComponents();
+        for (int i = 0; i < cs.length; i++) {
+            if (cs[i] instanceof JButton b) styleToggleBtn(b, i == idx);
+        }
+        Alternative alt = currentAlts.get(idx);
+        afficherResultat(ctxDep, ctxArr, ctxStart, alt.journey, alt.segs, alt.tripInfo,
+                ctxDeadline, ctxCal, ctxDate, alt.initialWalkSec);
+    }
+
+    // Temps de marche du point de départ au premier arrêt d'embarquement du trajet.
+    private int computeInitialWalkSec(Journey j, double[] originPt) {
+        if (j == null || j.destPath == null || j.destPath.isEmpty() || originPt == null) return 0;
+        String sid = j.destPath.get(0).fromStop;
+        if (sid == null) return 0;
+        String sql = "SELECT stop_lat::float, stop_lon::float FROM stops WHERE stop_id = ?";
+        try (Connection conn = Database.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, sid);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return Calculation.walkSeconds(originPt[0], originPt[1],
+                            rs.getDouble(1), rs.getDouble(2));
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("[INITIAL WALK ERROR] " + e.getMessage());
+        }
+        return 0;
     }
 
     private static void addIfNew(List<double[]> list, double[] pt) {
@@ -847,21 +1695,25 @@ public class AppWindow extends JFrame {
         list.add(pt);
     }
 
-    private void afficherResultat(String dep, String arr, String startTime, Journey j, List<double[]> route, String arrivalDeadline) {
+    private void afficherResultat(String dep, String arr, String startTime, Journey j,
+            List<MapPanel.RouteSeg> segs, Map<String, String[]> tripInfo,
+            String arrivalDeadline, Boolean calendarState, java.time.LocalDate travelDate,
+            int initialWalkSec) {
         mapPanel.clearRoute();
         if (j.destStopId == null) {
             resultLabel.setText("<html><b>" + esc(dep) + " → " + esc(arr) + "</b>"
                     + "<br><span style='color:#EF4444'>Aucun trajet trouvé.</span>"
-                    + "<br><small>Essayez un rayon plus large ou une autre heure.</small></html>");
+                    + "<br><small>Essayez un rayon plus large, une autre heure ou une autre date.</small></html>");
             return;
         }
-        if (!route.isEmpty()) mapPanel.setRoute(route);
+        if (!segs.isEmpty()) mapPanel.setRouteSegments(segs);
 
         // ── Calcul durée et correspondances ───────────────────────
         // Utiliser l'heure du premier leg (départ réel) plutôt que l'heure de recherche
         String actualDep = (!j.destPath.isEmpty() && j.destPath.get(0).departTime != null)
                 ? j.destPath.get(0).departTime : startTime;
-        int startSec    = Calculation.toSeconds(actualDep);
+        // Durée porte à porte : la marche initiale précède le départ du premier véhicule.
+        int startSec    = Calculation.toSeconds(actualDep) - Math.max(0, initialWalkSec);
         int arrSec      = Calculation.toSeconds(j.destTotalArrivalTime);
         int durationMin = Math.max(0, (arrSec - startSec) / 60);
         long transitLegs   = j.destPath.stream().filter(l -> !l.aPied).count();
@@ -874,6 +1726,17 @@ public class AppWindow extends JFrame {
           .append("&nbsp;<span style='color:#6B7280;font-size:11px'>")
           .append(correspondances).append(" correspondance").append(correspondances > 1 ? "s" : "")
           .append("</span><br>");
+        // État du filtre calendrier pour la date choisie
+        if (calendarState != null) {
+            String dateStr = travelDate.format(java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy"));
+            if (calendarState) {
+                sb.append("<span style='color:#10B981;font-size:10px'>Horaires du ")
+                  .append(dateStr).append("</span><br>");
+            } else {
+                sb.append("<span style='color:#F59E0B;font-size:10px'>Aucun service le ")
+                  .append(dateStr).append(" dans les données GTFS — horaires non filtrés</span><br>");
+            }
+        }
         if (arrivalDeadline != null) {
             boolean tooLate = Calculation.toSeconds(j.destTotalArrivalTime) > Calculation.toSeconds(arrivalDeadline);
             if (tooLate) {
@@ -887,13 +1750,25 @@ public class AppWindow extends JFrame {
         sb.append("<span style='color:#6B7280'>")
           .append(actualDep, 0, 5).append(" → ").append(heureArr).append("</span><br><br>");
 
+        // Marche initiale : point de départ -> premier arrêt d'embarquement
+        if (initialWalkSec > 60) {
+            sb.append("<span style='color:#9CA3AF'>&#x1F6B6; ").append(initialWalkSec / 60)
+              .append(" min à pied jusqu'au premier arrêt</span><br>");
+        }
+
         for (Leg leg : j.destPath) {
             if (leg.aPied) {
-                sb.append("<span style='color:#9CA3AF'>&#x1F6B6; Correspondance &nbsp;")
+                sb.append("<span style='color:#9CA3AF'>&#x1F6B6; Correspondance à pied &nbsp;")
                   .append(leg.departTime, 0, 5).append(" → ").append(leg.arriveTime, 0, 5)
                   .append("</span><br>");
             } else {
-                sb.append("<span style='color:#2563EB'>&#x1F687; ")
+                // Nom et couleur officielle de la ligne (route_color GTFS)
+                String[] info = tripInfo.get(leg.tripId);
+                String rname = (info != null && info[0] != null) ? info[0] : "Ligne";
+                String hex   = (info != null && info[1] != null && !info[1].isBlank())
+                        ? info[1].trim().replace("#", "") : "2563EB";
+                sb.append("<span style='color:#").append(hex).append("'>&#x1F687; <b>Ligne ")
+                  .append(esc(rname)).append("</b></span> <span style='color:#374151'>")
                   .append(leg.departTime, 0, 5).append(" → ").append(leg.arriveTime, 0, 5)
                   .append("</span><br>");
             }
@@ -904,19 +1779,17 @@ public class AppWindow extends JFrame {
         }
 
         // ── CO2 ───────────────────────────────────────────────────────
-        // Vitesse moyenne metro/RER : 30 km/h → 4 gCO2/km
-        // Marche : 0 gCO2. Voiture : 180 gCO2/km
         double transitKm = 0, walkKm = 0;
         for (Leg leg : j.destPath) {
             int legSec = Calculation.toSeconds(leg.arriveTime) - Calculation.toSeconds(leg.departTime);
             if (legSec < 0) legSec = 0;
-            if (leg.aPied) walkKm  += legSec / 3600.0 * 5.0;   // 5 km/h à pied
-            else            transitKm += legSec / 3600.0 * 30.0; // 30 km/h metro
+            if (leg.aPied) walkKm   += legSec / 3600.0 * 5.0;
+            else            transitKm += legSec / 3600.0 * 30.0;
         }
         walkKm += j.finalWalkSeconds / 3600.0 * 5.0;
-        double totalKm   = transitKm + walkKm;
-        double co2Metro  = transitKm * 4;    // 4 gCO2/km en transport
-        double co2Voiture = totalKm * 180;   // 180 gCO2/km en voiture
+        double totalKm    = transitKm + walkKm;
+        double co2Metro   = transitKm * 4;
+        double co2Voiture = totalKm * 180;
         int facteur = co2Metro > 0 ? (int) Math.round(co2Voiture / co2Metro) : (int) Math.round(co2Voiture);
         sb.append("<br><span style='color:#10B981;font-size:11px'>")
           .append("&#x1F331; ").append(String.format("%.0f", co2Metro)).append(" g CO₂")
@@ -940,25 +1813,21 @@ public class AppWindow extends JFrame {
                 : "<span style='color:#10B981'>✓ Arrive avant " + arrivalDeadline.substring(0, 5) + "</span>")
               .append("</p>");
         }
+        if (calendarState != null) {
+            String dateStr = travelDate.format(java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy"));
+            det.append(calendarState
+                ? "<p><span style='color:#10B981'>Horaires filtrés pour le " + dateStr + "</span></p>"
+                : "<p><span style='color:#F59E0B'>Aucun service actif le " + dateStr
+                  + " dans les données GTFS — horaires non filtrés</span></p>");
+        }
         det.append("<hr>");
 
-        // Résoudre les noms de lignes via trip_id → route_name
-        Map<String, String> tripToRoute = new HashMap<>();
-        List<String> transitTripIds = new ArrayList<>();
-        for (Leg leg : j.destPath)
-            if (!leg.aPied && leg.tripId != null) transitTripIds.add(leg.tripId);
-        if (!transitTripIds.isEmpty()) {
-            String placeholders = String.join(",", java.util.Collections.nCopies(transitTripIds.size(), "?"));
-            String routeSql = "SELECT t.trip_id, COALESCE(NULLIF(r.route_short_name,''), r.route_long_name) AS rname "
-                + "FROM trips t JOIN routes r ON r.route_id = t.route_id "
-                + "WHERE t.trip_id IN (" + placeholders + ")";
-            try (Connection rconn = Database.getConnection();
-                 PreparedStatement ps = rconn.prepareStatement(routeSql)) {
-                for (int i = 0; i < transitTripIds.size(); i++) ps.setString(i + 1, transitTripIds.get(i));
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) tripToRoute.put(rs.getString("trip_id"), rs.getString("rname"));
-                }
-            } catch (Exception ignored) {}
+        if (initialWalkSec > 60 && !j.destPath.isEmpty()) {
+            String firstName = stopIdToName.getOrDefault(j.destPath.get(0).fromStop,
+                    j.destPath.get(0).fromStop);
+            det.append("<p>&#x1F6B6; <b>Marche initiale</b> (~").append(initialWalkSec / 60)
+               .append(" min)<br><span style='color:#6B7280'>Du point de départ à ")
+               .append(esc(firstName)).append("</span></p>");
         }
 
         for (Leg leg : j.destPath) {
@@ -971,9 +1840,12 @@ public class AppWindow extends JFrame {
                    .append(" → ").append(esc(toName)).append("</span></p>");
             } else {
                 int legMin = (Calculation.toSeconds(leg.arriveTime) - Calculation.toSeconds(leg.departTime)) / 60;
-                String routeName = leg.tripId != null
-                    ? tripToRoute.getOrDefault(leg.tripId, "Ligne inconnue") : "Ligne inconnue";
-                det.append("<p><b>").append(esc(routeName)).append("</b> &nbsp;&#x1F687;<br>")
+                String[] info = tripInfo.get(leg.tripId);
+                String routeName = (info != null && info[0] != null) ? "Ligne " + info[0] : "Ligne inconnue";
+                String hex = (info != null && info[1] != null && !info[1].isBlank())
+                        ? info[1].trim().replace("#", "") : "2563EB";
+                det.append("<p><b style='color:#").append(hex).append("'>").append(esc(routeName))
+                   .append("</b> &nbsp;&#x1F687;<br>")
                    .append("Départ : <b>").append(leg.departTime, 0, 5).append("</b> — ")
                    .append(esc(fromName)).append("<br>")
                    .append("Arrivée : <b>").append(leg.arriveTime, 0, 5).append("</b> — ")
@@ -983,30 +1855,15 @@ public class AppWindow extends JFrame {
         }
         if (j.finalWalkSeconds > 60)
             det.append("<p>&#x1F6B6; Marche finale : <b>").append(j.finalWalkSeconds / 60).append(" min</b></p>");
-
-        // ── CO2 dans le détail ────────────────────────────────────────
-        det.append("<hr><h3 style='color:#10B981'>&#x1F331; Bilan CO₂</h3>")
-           .append("<table border='0' cellpadding='4'>")
-           .append("<tr><td><b>Transport en commun</b></td><td><b>")
-           .append(String.format("%.0f", co2Metro)).append(" g CO₂</b></td>")
-           .append("<td style='color:#6B7280'>(").append(String.format("%.1f", transitKm)).append(" km à 4 g/km)</td></tr>")
-           .append("<tr><td><b>Équivalent voiture</b></td><td><b>")
-           .append(String.format("%.0f", co2Voiture)).append(" g CO₂</b></td>")
-           .append("<td style='color:#6B7280'>(").append(String.format("%.1f", totalKm)).append(" km à 180 g/km)</td></tr>")
-           .append("</table>")
-           .append("<p style='color:#10B981'><b>")
-           .append(co2Metro > 0
-               ? "Vous émettez " + facteur + "× moins de CO₂ qu'en voiture 🌍"
-               : "Trajet entièrement à pied — 0 émission 🌍")
-           .append("</b></p>")
-           .append("<p style='color:#9CA3AF;font-size:10px'>Sources : ADEME — métro/RER 4 gCO₂/km, voiture thermique 180 gCO₂/km</p>");
-
         det.append("</body></html>");
 
         setResultat(sb.toString(), det.toString());
 
-        // Centrer la carte entre départ et arrivée
-        mapPanel.focusStation(dep);
+        // Cadrer la carte sur l'itinéraire complet
+        List<double[]> allPts = new ArrayList<>();
+        for (MapPanel.RouteSeg s : segs) allPts.addAll(s.points);
+        if (!allPts.isEmpty()) mapPanel.fitBounds(allPts);
+        else mapPanel.focusStation(dep);
     }
 
     // ── Helpers visuels ───────────────────────────────────────────
@@ -1086,12 +1943,21 @@ public class AppWindow extends JFrame {
 
     private void lancerKruskal() {
         setResultat("<html><i>Kruskal en cours…</i></html>", null);
-        SwingWorker<String[], Void> w = new SwingWorker<>() {
-            @Override protected String[] doInBackground() throws Exception { return calculerKruskal(); }
+        SwingWorker<Object[], Void> w = new SwingWorker<>() {
+            @Override protected Object[] doInBackground() throws Exception { return calculerKruskal(); }
             @Override protected void done() {
                 try {
-                    String[] r = get(120, java.util.concurrent.TimeUnit.SECONDS);
-                    setResultat(r[0], r[1]);
+                    Object[] r = get(120, java.util.concurrent.TimeUnit.SECONDS);
+                    setResultat((String) r[0], (String) r[1]);
+                    // Dessin de l'arborescence sur la carte, couleurs officielles des lignes
+                    @SuppressWarnings("unchecked")
+                    List<MapPanel.RouteSeg> segs = (List<MapPanel.RouteSeg>) r[2];
+                    if (segs != null && !segs.isEmpty()) {
+                        mapPanel.setRouteSegments(segs);
+                        List<double[]> pts = new ArrayList<>();
+                        for (MapPanel.RouteSeg s : segs) pts.addAll(s.points);
+                        mapPanel.fitBounds(pts);
+                    }
                 } catch (java.util.concurrent.TimeoutException tex) {
                     setResultat("<html><span style='color:#EF4444'>Timeout Kruskal.</span></html>", null);
                 } catch (Exception ex) {
@@ -1103,21 +1969,34 @@ public class AppWindow extends JFrame {
         w.execute();
     }
 
-    private String[] calculerKruskal() throws Exception {
-        // Paires d'arrêts consécutifs dans les trips (LEAD évite la self-join lourde)
+    // Renvoie {résumé HTML, détail HTML, segments de l'ACM à dessiner sur la carte}.
+    private Object[] calculerKruskal() throws Exception {
+        // Paires d'arrêts consécutifs dans les trips (LEAD évite la self-join lourde),
+        // accrochées aux stations parentes et enrichies de la couleur officielle de la ligne
+        // (route_color) pour un rendu type plan RATP.
         String sql =
-            "SELECT DISTINCT s1.stop_id AS fid, s1.stop_lat::float AS flat, s1.stop_lon::float AS flon, "
-            + "s2.stop_id AS tid, s2.stop_lat::float AS tlat, s2.stop_lon::float AS tlon "
+            "SELECT r.route_id AS rid, "
+            + "COALESCE(p1.stop_id, s1.stop_id) AS fid, "
+            + "COALESCE(p1.stop_lat, s1.stop_lat)::float AS flat, "
+            + "COALESCE(p1.stop_lon, s1.stop_lon)::float AS flon, "
+            + "COALESCE(p2.stop_id, s2.stop_id) AS tid, "
+            + "COALESCE(p2.stop_lat, s2.stop_lat)::float AS tlat, "
+            + "COALESCE(p2.stop_lon, s2.stop_lon)::float AS tlon, "
+            + "MIN(r.route_color) AS color "
             + "FROM (SELECT trip_id, stop_id, "
             + "      LEAD(stop_id) OVER (PARTITION BY trip_id ORDER BY stop_sequence) AS nxt "
             + "      FROM stop_times) t "
+            + "JOIN trips tr ON tr.trip_id = t.trip_id "
+            + "JOIN routes r ON r.route_id = tr.route_id "
             + "JOIN stops s1 ON s1.stop_id = t.stop_id "
             + "JOIN stops s2 ON s2.stop_id = t.nxt "
-            + "WHERE t.nxt IS NOT NULL AND s1.stop_lat IS NOT NULL AND s2.stop_lat IS NOT NULL";
+            + "LEFT JOIN stops p1 ON p1.stop_id = s1.parent_station "
+            + "LEFT JOIN stops p2 ON p2.stop_id = s2.parent_station "
+            + "WHERE t.nxt IS NOT NULL AND s1.stop_lat IS NOT NULL AND s2.stop_lat IS NOT NULL "
+            + "GROUP BY 1, 2, 3, 4, 5, 6, 7";
 
         Map<String, Integer> idx = new LinkedHashMap<>();
-        List<int[]>          edgeIdx = new ArrayList<>();
-        List<Double>         edgeW   = new ArrayList<>();
+        Map<String, List<KEdge>> routeEdges = new LinkedHashMap<>();
 
         try (Connection conn = Database.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql);
@@ -1130,13 +2009,49 @@ public class AppWindow extends JFrame {
                 idx.putIfAbsent(tid, idx.size());
                 int fi = idx.get(fid), ti = idx.get(tid);
                 if (fi == ti) continue;
-                edgeIdx.add(new int[]{fi, ti});
-                edgeW.add(Calculation.haversine(flat, flon, tlat, tlon));
+                routeEdges.computeIfAbsent(rs.getString("rid"), k -> new ArrayList<>())
+                        .add(new KEdge(fi, ti,
+                                Calculation.haversine(flat, flon, tlat, tlon),
+                                new double[]{flat, flon, tlat, tlon},
+                                rs.getString("color")));
             }
         }
 
         int n = idx.size();
-        if (n == 0) return new String[]{"<html>Aucune donnée disponible.</html>", null};
+        if (n == 0) return new Object[]{"<html>Aucune donnée disponible.</html>", null, null};
+
+        // Filtrage des sauts express (RER notamment) : au sein d'une même ligne, une arête
+        // que l'on peut remplacer par un chemin d'autres arêtes de longueur comparable
+        // (<= 2x) est un trajet direct qui saute des gares : on ne la trace pas.
+        List<KEdge> kept = new ArrayList<>();
+        for (List<KEdge> edges : routeEdges.values()) {
+            Map<Integer, List<KEdge>> adj = new HashMap<>();
+            for (KEdge e : edges) {
+                adj.computeIfAbsent(e.fi, k -> new ArrayList<>()).add(e);
+                adj.computeIfAbsent(e.ti, k -> new ArrayList<>()).add(e);
+            }
+            List<KEdge> sorted = new ArrayList<>(edges);
+            sorted.sort((x, y) -> Double.compare(y.w, x.w));      // plus longues d'abord
+            for (KEdge e : sorted) {
+                if (kAltPath(adj, e, 2.0 * e.w) <= 2.0 * e.w) e.removed = true;
+            }
+            for (KEdge e : edges) {
+                if (!e.removed) kept.add(e);
+            }
+        }
+
+        // Arêtes dédupliquées entre lignes pour les statistiques (Kruskal inchangé).
+        Map<Long, KEdge> uniq = new LinkedHashMap<>();
+        for (KEdge e : kept) {
+            long key = (long) Math.min(e.fi, e.ti) * 1_000_000L + Math.max(e.fi, e.ti);
+            uniq.putIfAbsent(key, e);
+        }
+        List<int[]>  edgeIdx = new ArrayList<>();
+        List<Double> edgeW   = new ArrayList<>();
+        for (KEdge e : uniq.values()) {
+            edgeIdx.add(new int[]{e.fi, e.ti});
+            edgeW.add(e.w);
+        }
 
         // Trier les arêtes par poids
         Integer[] order = new Integer[edgeIdx.size()];
@@ -1157,6 +2072,16 @@ public class AppWindow extends JFrame {
                 mstEdges++;
                 totalDist += edgeW.get(i);
             }
+        }
+
+        // Rendu carte : réseau complet filtré (toutes les arêtes station à station hors
+        // sauts express, couleurs de ligne), sans les trous du seul arbre couvrant.
+        List<MapPanel.RouteSeg> segs = new ArrayList<>();
+        for (KEdge e : kept) {
+            double[] p = e.pts;
+            segs.add(new MapPanel.RouteSeg(
+                    List.of(new double[]{p[0], p[1]}, new double[]{p[2], p[3]}),
+                    routeColor(new String[]{null, e.color}), false));
         }
 
         // Taille de chaque composante
@@ -1191,7 +2116,51 @@ public class AppWindow extends JFrame {
         }
         det.append("</table></body></html>");
 
-        return new String[]{summary, det.toString()};
+        return new Object[]{summary, det.toString(), segs};
+    }
+
+    // Arête d'une ligne (indices de stations dans idx), pour le filtrage des sauts express.
+    private static class KEdge {
+        final int fi, ti;
+        final double w;
+        final double[] pts;    // {flat, flon, tlat, tlon}
+        final String color;
+        boolean removed = false;
+
+        KEdge(int fi, int ti, double w, double[] pts, String color) {
+            this.fi = fi;
+            this.ti = ti;
+            this.w = w;
+            this.pts = pts;
+            this.color = color;
+        }
+    }
+
+    // Plus court chemin entre les extrémités de excl dans le graphe de SA ligne, sans excl
+    // ni les arêtes déjà retirées. Abandonne dès que la distance dépasse limit.
+    private static double kAltPath(Map<Integer, List<KEdge>> adj, KEdge excl, double limit) {
+        Map<Integer, Double> dist = new HashMap<>();
+        PriorityQueue<double[]> pq = new PriorityQueue<>(Comparator.comparingDouble(a -> a[1]));
+        dist.put(excl.fi, 0.0);
+        pq.add(new double[]{excl.fi, 0.0});
+        while (!pq.isEmpty()) {
+            double[] cur = pq.poll();
+            int u = (int) cur[0];
+            double du = cur[1];
+            if (du > dist.getOrDefault(u, Double.MAX_VALUE)) continue;
+            if (u == excl.ti) return du;
+            if (du > limit) return Double.MAX_VALUE;
+            for (KEdge e : adj.getOrDefault(u, Collections.emptyList())) {
+                if (e == excl || e.removed) continue;
+                int v = (e.fi == u) ? e.ti : e.fi;
+                double nd = du + e.w;
+                if (nd < dist.getOrDefault(v, Double.MAX_VALUE)) {
+                    dist.put(v, nd);
+                    pq.add(new double[]{v, nd});
+                }
+            }
+        }
+        return Double.MAX_VALUE;
     }
 
     private int kFind(int[] p, int x) {
@@ -1210,7 +2179,7 @@ public class AppWindow extends JFrame {
     private void lancerBFS() {
         setResultat("<html><i>BFS en cours…</i></html>", null);
         SwingWorker<String[], Void> w = new SwingWorker<>() {
-            @Override protected String[] doInBackground() throws Exception { return calculerBFS(); }
+            @Override protected String[] doInBackground() throws Exception { return calculerBFS2(); }
             @Override protected void done() {
                 try {
                     String[] r = get(120, java.util.concurrent.TimeUnit.SECONDS);
@@ -1305,6 +2274,28 @@ public class AppWindow extends JFrame {
         det.append("</table></body></html>");
 
         return new String[]{sumSb.toString(), det.toString()};
+    }
+
+    private String[] calculerBFS2() throws Exception {
+        // 1. Connexion et chargement des données (exécuté en tâche de fond)
+        // Adaptation minime : Database.getConnection() lit DATABASE_URL depuis
+        // l'environnement OU db.properties (SupabaseConnector exige la variable d'env).
+        Connection connection = Database.getConnection();
+        DataLoader loader = new DataLoader(connection);
+        Graph graph = GraphBuilder.build(loader);
+
+        // 2. Appel de ta logique BFS
+        boolean connected = BFS.isConnected(graph);
+
+        // 3. Préparation des résultats pour l'affichage (index 0 = titre/statut, index 1 = détails)
+        String statut = connected
+                ? "<html><b style='color:#10B981'>Le graphe est connexe (Connected)</b></html>"
+                : "<html><b style='color:#EF4444'>Le graphe n'est pas connexe (Not connected)</b></html>";
+
+        String details = "Nombre total de sommets : " + graph.getVertices().size();
+
+        // On retourne le tableau attendu par le SwingWorker [r[0], r[1]]
+        return new String[]{statut, details};
     }
 
     // ── PMR accessibles ───────────────────────────────────────────
